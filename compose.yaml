@@ -1,0 +1,117 @@
+services:
+
+  identity:
+
+    build: ./identity
+
+    container_name: django-identity
+
+    volumes:
+      - ./identity:/app
+      - static-data:/app/staticfiles
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY}
+      DEBUG: ${DEBUG}
+      ALLOWED_HOSTS: ${ALLOWED_HOSTS}
+      REDIS_URL: redis://redis:6379/1
+
+      SECURE_SSL_REDIRECT: ${SECURE_SSL_REDIRECT}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE}
+      CSRF_COOKIE_SECURE: ${CSRF_COOKIE_SECURE}
+
+      SECURE_HSTS_SECONDS: ${SECURE_HSTS_SECONDS}
+      SECURE_HSTS_INCLUDE_SUBDOMAINS: ${SECURE_HSTS_INCLUDE_SUBDOMAINS}
+      SECURE_HSTS_PRELOAD: ${SECURE_HSTS_PRELOAD}
+
+      LOGIN_RATE_LIMIT_IP: ${LOGIN_RATE_LIMIT_IP}
+      LOGIN_RATE_LIMIT_USER: ${LOGIN_RATE_LIMIT_USER}
+
+      MFA_RATE_LIMIT_IP: ${MFA_RATE_LIMIT_IP}
+      MFA_RATE_LIMIT_USER: ${MFA_RATE_LIMIT_USER}
+
+      RATE_LIMIT_WINDOW: ${RATE_LIMIT_WINDOW}
+      RATE_LIMIT_BLOCK: ${RATE_LIMIT_BLOCK}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+    networks:
+      - identity-network
+
+
+
+  redis:
+
+    image: redis:8-alpine
+
+    container_name: identity-redis
+
+    command: redis-server --appendonly yes
+
+    volumes:
+      - redis-data:/data
+
+    networks:
+      - identity-network
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+
+    image: postgres:17
+
+    container_name: identity-postgres
+
+    environment:
+      POSTGRES_DB: identitydb
+      POSTGRES_USER: identityuser
+      POSTGRES_PASSWORD: identitypass
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    ports:
+      - "5432:5432"
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U identityuser -d identitydb"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - identity-network
+
+
+volumes:
+
+  postgres-data:
+
+  static-data:
+
+  redis-data:
+
+
+networks:
+
+  identity-network:
