@@ -1,29 +1,54 @@
 import os
-from django.core.cache import cache
-from django.db import transaction
 
+from django.db import transaction
+from rest_framework.exceptions import Throttled
 from rest_framework import serializers
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from rest_framework_simplejwt.views import TokenObtainPairView
+
+from rest_framework_simplejwt.serializers import (
+    TokenObtainPairSerializer,
+)
+
+from rest_framework_simplejwt.views import (
+    TokenObtainPairView,
+)
 
 from .mfa import verify_totp_code_with_counter
-from .models import User
+
+from .mfa_recovery import (
+    verify_and_consume_recovery_code,
+)
+
+from .models import (
+    User,
+    AuditLog,
+)
+
 from .rate_limit import check_rate_limit
 
+
+# ============================================================
+# CLIENT IP
+# ============================================================
 
 def get_client_ip(request):
     """
     Obtém o IP do cliente.
 
-    Em produção, o tratamento de X-Forwarded-For
-    deve ser feito somente quando existe um proxy
-    confiável configurado.
+    Em produção, X-Forwarded-For deve ser aceite
+    apenas quando existe proxy confiável.
     """
 
-    forwarded_for = request.META.get("HTTP_X_FORWARDED_FOR")
+    forwarded_for = request.META.get(
+        "HTTP_X_FORWARDED_FOR"
+    )
 
     if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+
+        return (
+            forwarded_for
+            .split(",")[0]
+            .strip()
+        )
 
     return request.META.get(
         "REMOTE_ADDR",
@@ -31,19 +56,75 @@ def get_client_ip(request):
     )
 
 
-def apply_login_rate_limit(request, username):
-    """
-    Registra uma tentativa de autenticação falhada.
+# ============================================================
+# RECOVERY LOGIN AUDIT
+# ============================================================
 
-    O limite é aplicado por IP e por username.
+def create_recovery_login_audit(
+    request,
+    user,
+    action,
+    description,
+    result,
+    status_code,
+):
+    """
+    Regista eventos de autenticação através
+    de MFA Recovery Code.
+
+    A ausência de organização não deve impedir
+    a autenticação.
     """
 
-    ip = get_client_ip(request)
+    organization = getattr(
+        user,
+        "organization",
+        None,
+    )
+
+    if organization is None:
+        return
+
+    AuditLog.objects.create(
+        organization=organization,
+        user=user,
+        action=action,
+        description=description,
+        ip_address=get_client_ip(request),
+        http_method=request.method,
+        endpoint=request.path,
+        user_agent=request.META.get(
+            "HTTP_USER_AGENT"
+        ),
+        status_code=status_code,
+        result=result,
+    )
+
+
+# ============================================================
+# NORMAL LOGIN RATE LIMIT
+# ============================================================
+
+def apply_login_rate_limit(
+    request,
+    username,
+):
+    """
+    Rate limit do login normal.
+
+    Proteção por:
+        - IP
+        - username
+    """
+
+    ip = get_client_ip(
+        request
+    )
 
     window = int(
         os.getenv(
             "RATE_LIMIT_WINDOW",
-            60
+            60,
         )
     )
 
@@ -52,7 +133,7 @@ def apply_login_rate_limit(request, username):
         limit=int(
             os.getenv(
                 "LOGIN_RATE_LIMIT_IP",
-                10
+                10,
             )
         ),
         window=window,
@@ -63,26 +144,37 @@ def apply_login_rate_limit(request, username):
         limit=int(
             os.getenv(
                 "LOGIN_RATE_LIMIT_USER",
-                5
+                5,
             )
         ),
         window=window,
     )
 
 
-def apply_mfa_rate_limit(request, username):
-    """
-    Registra uma tentativa MFA falhada.
+# ============================================================
+# MFA RATE LIMIT
+# ============================================================
 
-    O limite é aplicado por IP e por username.
+def apply_mfa_rate_limit(
+    request,
+    username,
+):
+    """
+    Rate limit para MFA.
+
+    Proteção por:
+        - IP
+        - username
     """
 
-    ip = get_client_ip(request)
+    ip = get_client_ip(
+        request
+    )
 
     window = int(
         os.getenv(
             "RATE_LIMIT_WINDOW",
-            60
+            60,
         )
     )
 
@@ -91,7 +183,7 @@ def apply_mfa_rate_limit(request, username):
         limit=int(
             os.getenv(
                 "MFA_RATE_LIMIT_IP",
-                10
+                10,
             )
         ),
         window=window,
@@ -102,20 +194,60 @@ def apply_mfa_rate_limit(request, username):
         limit=int(
             os.getenv(
                 "MFA_RATE_LIMIT_USER",
-                5
+                5,
             )
         ),
         window=window,
     )
 
-
-class MFATokenObtainPairSerializer(TokenObtainPairSerializer):
+def apply_recovery_rate_limit(
+    request,
+    username,
+    user,
+):
     """
-    Autenticação JWT com suporte a MFA/TOTP.
+    Aplica rate limiting ao login por recovery code.
 
-    Utilizadores sem MFA continuam a autenticar normalmente.
+    Quando o limite é efetivamente atingido,
+    cria um evento de auditoria específico e
+    mantém a resposta HTTP 429 original.
+    """
 
-    Utilizadores com MFA ativado precisam fornecer:
+    try:
+
+        apply_mfa_rate_limit(
+            request,
+            username,
+        )
+
+    except Throttled:
+
+        create_recovery_login_audit(
+            request=request,
+            user=user,
+            action="MFA_RECOVERY_RATE_LIMITED",
+            description=(
+                "Login por recovery code bloqueado "
+                "por excesso de tentativas."
+            ),
+            result="FAILURE",
+            status_code=429,
+        )
+
+        raise	
+
+
+# ============================================================
+# MFA / TOTP LOGIN
+# ============================================================
+
+class MFATokenObtainPairSerializer(
+    TokenObtainPairSerializer
+):
+    """
+    Login JWT utilizando MFA/TOTP.
+
+    Utilizadores com MFA ativo devem fornecer:
 
         username
         password
@@ -128,74 +260,132 @@ class MFATokenObtainPairSerializer(TokenObtainPairSerializer):
         write_only=True,
     )
 
-    def validate(self, attrs):
+    def validate(
+        self,
+        attrs,
+    ):
 
-        username = attrs.get("username", "")
+        username = attrs.get(
+            "username",
+            "",
+        )
+
+        request = self.context[
+            "request"
+        ]
+
+        # ------------------------------------------------------
+        # USERNAME + PASSWORD
+        # ------------------------------------------------------
 
         try:
-            data = super().validate(attrs)
+
+            data = super().validate(
+                attrs
+            )
 
         except serializers.ValidationError:
+
             apply_mfa_rate_limit(
-                self.context["request"],
+                request,
                 username,
             )
+
             raise
 
-        code = attrs.get("code")
+        # ------------------------------------------------------
+        # USER WITHOUT MFA
+        # ------------------------------------------------------
 
         if not self.user.mfa_enabled:
+
             return data
 
+        code = attrs.get(
+            "code"
+        )
+
+        # ------------------------------------------------------
+        # MFA CODE REQUIRED
+        # ------------------------------------------------------
+
         if not code:
+
             apply_mfa_rate_limit(
-                self.context["request"],
+                request,
                 username,
             )
 
             raise serializers.ValidationError(
-                {"code": "MFA code is required."}
+                {
+                    "code": (
+                        "MFA code is required."
+                    )
+                }
             )
+
+        # ------------------------------------------------------
+        # TOTP VALIDATION + ANTI-REPLAY
+        # ------------------------------------------------------
 
         with transaction.atomic():
 
             user = (
                 User.objects
                 .select_for_update()
-                .get(pk=self.user.pk)
+                .get(
+                    pk=self.user.pk
+                )
             )
 
-            counter = verify_totp_code_with_counter(
-                user.mfa_secret,
-                code,
+            counter = (
+                verify_totp_code_with_counter(
+                    user.mfa_secret,
+                    code,
+                )
             )
 
             if counter is None:
 
                 apply_mfa_rate_limit(
-                    self.context["request"],
+                    request,
                     username,
                 )
 
                 raise serializers.ValidationError(
-                    {"code": "Invalid MFA code."}
+                    {
+                        "code": (
+                            "Invalid MFA code."
+                        )
+                    }
                 )
 
             if (
-                user.mfa_last_used_counter is not None
-                and counter <= user.mfa_last_used_counter
+                user.mfa_last_used_counter
+                is not None
+                and
+                counter
+                <=
+                user.mfa_last_used_counter
             ):
 
                 apply_mfa_rate_limit(
-                    self.context["request"],
+                    request,
                     username,
                 )
 
                 raise serializers.ValidationError(
-                    {"code": "MFA code has already been used."}
+                    {
+                        "code": (
+                            "MFA code has already "
+                            "been used."
+                        )
+                    }
                 )
 
-            user.mfa_last_used_counter = counter
+            user.mfa_last_used_counter = (
+                counter
+            )
 
             user.save(
                 update_fields=[
@@ -206,30 +396,56 @@ class MFATokenObtainPairSerializer(TokenObtainPairSerializer):
         return data
 
 
-class MFATokenObtainPairView(TokenObtainPairView):
-    serializer_class = MFATokenObtainPairSerializer
+class MFATokenObtainPairView(
+    TokenObtainPairView
+):
+
+    serializer_class = (
+        MFATokenObtainPairSerializer
+    )
 
 
-class NormalTokenObtainPairSerializer(TokenObtainPairSerializer):
+# ============================================================
+# NORMAL LOGIN
+# ============================================================
+
+class NormalTokenObtainPairSerializer(
+    TokenObtainPairSerializer
+):
     """
     Login JWT normal.
 
-    Se MFA estiver ativado, o login normal é bloqueado.
-    O utilizador deve utilizar /api/token/mfa/.
+    Se MFA estiver ativo, o login normal
+    é bloqueado.
     """
 
-    def validate(self, attrs):
+    def validate(
+        self,
+        attrs,
+    ):
 
-        username = attrs.get("username", "")
+        username = attrs.get(
+            "username",
+            "",
+        )
+
+        request = self.context[
+            "request"
+        ]
 
         try:
-            data = super().validate(attrs)
+
+            data = super().validate(
+                attrs
+            )
 
         except serializers.ValidationError:
+
             apply_login_rate_limit(
-                self.context["request"],
+                request,
                 username,
             )
+
             raise
 
         user = self.user
@@ -237,15 +453,16 @@ class NormalTokenObtainPairSerializer(TokenObtainPairSerializer):
         if user.mfa_enabled:
 
             apply_login_rate_limit(
-                self.context["request"],
+                request,
                 username,
             )
 
             raise serializers.ValidationError(
                 {
                     "code": (
-                        "MFA is enabled for this account. "
-                        "Use the MFA login endpoint."
+                        "MFA is enabled for this "
+                        "account. Use the MFA "
+                        "login endpoint."
                     )
                 }
             )
@@ -253,5 +470,169 @@ class NormalTokenObtainPairSerializer(TokenObtainPairSerializer):
         return data
 
 
-class NormalTokenObtainPairView(TokenObtainPairView):
-    serializer_class = NormalTokenObtainPairSerializer
+class NormalTokenObtainPairView(
+    TokenObtainPairView
+):
+
+    serializer_class = (
+        NormalTokenObtainPairSerializer
+    )
+
+
+# ============================================================
+# MFA RECOVERY LOGIN
+# ============================================================
+
+class MFARecoveryTokenObtainPairSerializer(
+    TokenObtainPairSerializer
+):
+    """
+    Login utilizando MFA Recovery Code.
+
+    Requer:
+
+        username
+        password
+        recovery_code
+    """
+
+    recovery_code = serializers.CharField(
+        required=True,
+        write_only=True,
+    )
+
+    def validate(
+        self,
+        attrs,
+    ):
+
+        username = attrs.get(
+            "username",
+            "",
+        )
+
+        request = self.context[
+            "request"
+        ]
+
+        # ------------------------------------------------------
+        # USERNAME + PASSWORD
+        # ------------------------------------------------------
+
+        try:
+
+            data = super().validate(
+                attrs
+            )
+
+        except serializers.ValidationError:
+
+            apply_mfa_rate_limit(
+                request,
+                username,
+            )
+
+            raise
+
+        user = self.user
+
+        # ------------------------------------------------------
+        # MFA MUST BE ENABLED
+        # ------------------------------------------------------
+
+        if not user.mfa_enabled:
+
+            create_recovery_login_audit(
+                request=request,
+                user=user,
+                action=(
+                    "MFA_RECOVERY_LOGIN_FAILED"
+                ),
+                description=(
+                    "Recovery login recusado: "
+                    "MFA não está ativado."
+                ),
+                result="FAILURE",
+                status_code=400,
+            )
+
+            raise serializers.ValidationError(
+                {
+                    "recovery_code": (
+                        "MFA is not enabled "
+                        "for this account."
+                    )
+                }
+            )
+
+        recovery_code = attrs.get(
+            "recovery_code"
+        )
+
+        # ------------------------------------------------------
+        # VERIFY + CONSUME CODE
+        # ------------------------------------------------------
+
+        if not verify_and_consume_recovery_code(
+            user,
+            recovery_code,
+        ):
+
+            create_recovery_login_audit(
+                request=request,
+                user=user,
+                action=(
+                    "MFA_RECOVERY_LOGIN_FAILED"
+                ),
+                description=(
+                    "Recovery login falhou: "
+                    "código inválido ou "
+                    "já utilizado."
+                ),
+                result="FAILURE",
+                status_code=400,
+            )
+
+            apply_recovery_rate_limit(
+                request,
+                username,
+                user,
+            )
+
+            raise serializers.ValidationError(
+                {
+                    "recovery_code": (
+                        "Invalid or already used "
+                        "recovery code."
+                    )
+                }
+            )
+
+        # ------------------------------------------------------
+        # SUCCESS AUDIT
+        # ------------------------------------------------------
+
+        create_recovery_login_audit(
+            request=request,
+            user=user,
+            action=(
+                "MFA_RECOVERY_LOGIN_SUCCESS"
+            ),
+            description=(
+                "Login MFA realizado com "
+                "recovery code."
+            ),
+            result="SUCCESS",
+            status_code=200,
+        )
+
+        return data
+
+
+class MFARecoveryTokenObtainPairView(
+    TokenObtainPairView
+):
+
+    serializer_class = (
+        MFARecoveryTokenObtainPairSerializer
+    )

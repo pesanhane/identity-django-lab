@@ -274,3 +274,47 @@ class AuditLog(models.Model):
     created_at = models.DateTimeField(
         auto_now_add=True
     )
+
+class MFARecoveryCode(models.Model):
+    """
+    Código de recuperação MFA de uso único.
+
+    O código em texto puro nunca é armazenado.
+    Apenas o hash é persistido.
+    """
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="mfa_recovery_codes"
+    )
+
+    code_hash = models.CharField(
+        max_length=128
+    )
+
+    used_at = models.DateTimeField(
+        null=True,
+        blank=True
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True
+    )
+
+    def __str__(self):
+        status = (
+            "used"
+            if self.used_at
+            else "unused"
+        )
+
+        return (
+            f"MFA recovery code "
+            f"for {self.user.username} "
+            f"({status})"
+        )
+
+    @property
+    def is_used(self):
+        return self.used_at is not None

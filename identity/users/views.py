@@ -1,3 +1,5 @@
+from .mfa_recovery import generate_recovery_codes
+
 from django.db import transaction
 from django.utils import timezone
 
@@ -1156,3 +1158,39 @@ class DeactivateUserView(APIView):
             "user": user.username,
             "is_active": user.is_active
         })
+
+# ============================================================
+# MFA RECOVERY CODES
+# ============================================================
+
+class MFARecoveryCodesView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+
+        user = request.user
+
+        if not user.mfa_enabled:
+            return Response(
+                {
+                    "error": "MFA must be enabled before generating recovery codes."
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        codes = generate_recovery_codes(user)
+
+        create_audit_log(
+            request,
+            "MFA_RECOVERY_CODES_GENERATED",
+            f"Recovery codes gerados para {user.username}"
+        )
+
+        return Response(
+            {
+                "message": "Recovery codes generated successfully.",
+                "recovery_codes": codes,
+            },
+            status=status.HTTP_200_OK
+        )

@@ -17,6 +17,7 @@ from .views import (
     GroupDetailView,
     MFASetupView,
     MFAVerifyView,
+    MFARecoveryCodesView,
 )
 
 
@@ -136,5 +137,11 @@ path(
     "groups/<int:id>/",
     GroupDetailView.as_view(),
     name="group-detail"
+),
+
+path(
+    "me/mfa/recovery-codes/",
+    MFARecoveryCodesView.as_view(),
+    name="mfa-recovery-codes"
 ),
 ]

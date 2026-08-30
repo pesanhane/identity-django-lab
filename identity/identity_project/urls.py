@@ -5,6 +5,7 @@ from django.urls import path,include
 from users.authentication import (
     MFATokenObtainPairView,
     NormalTokenObtainPairView,
+    MFARecoveryTokenObtainPairView,
 )
 
 from rest_framework_simplejwt.views import (
@@ -25,5 +26,8 @@ urlpatterns = [
     path("api/token/mfa/",MFATokenObtainPairView.as_view(),name="token_mfa"),
 
     path("api/token/refresh/",TokenRefreshView.as_view(),name="token_refresh"),
+    path("api/token/mfa/recovery/",MFARecoveryTokenObtainPairView.as_view(),
+    name="token_mfa_recovery",
+),
 
 ]
