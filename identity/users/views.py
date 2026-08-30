@@ -1,3 +1,4 @@
+
 from .mfa_recovery import generate_recovery_codes
 
 from django.db import transaction
@@ -6,9 +7,12 @@ from django.utils import timezone
 from .rbac import DynamicPermission
 
 
-from .mfa import verify_totp_code_with_counter
 
 
+from rest_framework.exceptions import Throttled
+
+
+from .authentication import apply_mfa_rate_limit
 
 from .models import (
     User,
@@ -55,6 +59,11 @@ from .mfa import (
 # ============================================================
 # LISTAR E CRIAR UTILIZADORES
 # ==========================================================
+# imports
+from rest_framework.exceptions import Throttled
+
+
+
 class UserList(APIView):
 
     permission_classes = [DynamicPermission]
@@ -414,6 +423,362 @@ class MFAVerifyView(APIView):
                 "mfa_enabled": True,
             },
             status=status.HTTP_200_OK
+        )
+
+def apply_mfa_disable_rate_limit(
+    request,
+    user,
+):
+    """
+    Aplica rate limiting às tentativas falhadas
+    de desativação do MFA.
+
+    Retorna True quando o limite foi atingido.
+    Retorna False caso a tentativa ainda esteja
+    dentro do limite.
+    """
+
+    try:
+
+        apply_mfa_rate_limit(
+            request,
+            user.username,
+        )
+
+        return False
+
+    except Throttled:
+
+        create_audit_log(
+            request,
+            "MFA_DISABLE_RATE_LIMITED",
+            (
+                "Desativação MFA bloqueada "
+                "por excesso de tentativas."
+            ),
+            status_code=429,
+            result="FAILURE",
+        )
+
+        return True
+
+class MFADisableView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+
+        user = request.user
+
+        # ======================================================
+        # MFA MUST BE ENABLED
+        # ======================================================
+
+        if not user.mfa_enabled:
+
+            return Response(
+                {
+                    "error": (
+                        "MFA is not enabled for this user."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        password = request.data.get(
+            "password"
+        )
+
+        code = request.data.get(
+            "code"
+        )
+
+        # ======================================================
+        # PASSWORD REQUIRED
+        # ======================================================
+
+        if not password:
+
+            create_audit_log(
+                request,
+                "MFA_DISABLE_FAILED",
+                (
+                    "Desativação MFA recusada: "
+                    "password ausente."
+                ),
+                status_code=400,
+                result="FAILURE",
+            )
+
+            return Response(
+                {
+                    "password": (
+                        "Current password is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ======================================================
+        # TOTP REQUIRED
+        # ======================================================
+
+        if not code:
+
+            create_audit_log(
+                request,
+                "MFA_DISABLE_FAILED",
+                (
+                    "Desativação MFA recusada: "
+                    "código MFA ausente."
+                ),
+                status_code=400,
+                result="FAILURE",
+            )
+
+            return Response(
+                {
+                    "code": (
+                        "MFA code is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ======================================================
+        # STRONG REAUTHENTICATION
+        # ======================================================
+
+        with transaction.atomic():
+
+            locked_user = (
+                User.objects
+                .select_for_update()
+                .get(pk=user.pk)
+            )
+
+            # --------------------------------------------------
+            # PASSWORD VALIDATION
+            # --------------------------------------------------
+
+            if not locked_user.check_password(
+                password
+            ):
+
+                rate_limited = (
+                    apply_mfa_disable_rate_limit(
+                        request,
+                        locked_user,
+                    )
+                )
+
+                if rate_limited:
+
+                    return Response(
+                        {
+                            "detail": (
+                                "Too many failed MFA disable attempts. "
+                                "Try again later."
+                            )
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                create_audit_log(
+                    request,
+                    "MFA_DISABLE_FAILED",
+                    (
+                        "Desativação MFA recusada: "
+                        "password inválida."
+                    ),
+                    status_code=400,
+                    result="FAILURE",
+                )
+
+                return Response(
+                    {
+                        "password": (
+                            "Invalid current password."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # --------------------------------------------------
+            # MFA SECRET
+            # --------------------------------------------------
+
+            if not locked_user.mfa_secret:
+
+                create_audit_log(
+                    request,
+                    "MFA_DISABLE_FAILED",
+                    (
+                        "Desativação MFA recusada: "
+                        "secret MFA inexistente."
+                    ),
+                    status_code=400,
+                    result="FAILURE",
+                )
+
+                return Response(
+                    {
+                        "code": (
+                            "MFA configuration is invalid."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # --------------------------------------------------
+            # VERIFY TOTP
+            # --------------------------------------------------
+
+            counter = (
+                verify_totp_code_with_counter(
+                    locked_user.mfa_secret,
+                    code,
+                )
+            )
+            if counter is None:
+
+                rate_limited = (
+                    apply_mfa_disable_rate_limit(
+                        request,
+                        locked_user,
+                    )
+                )
+
+                if rate_limited:
+
+                    return Response(
+                        {
+                            "detail": (
+                                "Too many failed MFA disable attempts. "
+                                "Try again later."
+                            )
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+
+                create_audit_log(
+                    request,
+                    "MFA_DISABLE_FAILED",
+                    (
+                        "Desativação MFA recusada: "
+                        "código MFA inválido."
+                    ),
+                    status_code=400,
+                    result="FAILURE",
+                )
+
+                return Response(
+                    {
+                        "code": (
+                            "Invalid MFA code."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # --------------------------------------------------
+            # ANTI-REPLAY
+            # --------------------------------------------------
+            if (
+                    locked_user.mfa_last_used_counter
+                    is not None
+                    and
+                    counter <= locked_user.mfa_last_used_counter
+                ):
+
+                    rate_limited = (
+                        apply_mfa_disable_rate_limit(
+                            request,
+                            locked_user,
+                        )
+                    )
+
+                    if rate_limited:
+
+                        return Response(
+                            {
+                                "detail": (
+                                    "Too many failed MFA disable attempts. "
+                                    "Try again later."
+                                )
+                            },
+                            status=status.HTTP_429_TOO_MANY_REQUESTS,
+                        )
+
+                    create_audit_log(
+                        request,
+                        "MFA_DISABLE_REPLAY_DETECTED",
+                        (
+                            "Tentativa de desativação MFA "
+                            "com código TOTP reutilizado."
+                        ),
+                        status_code=400,
+                        result="FAILURE",
+                    )
+
+                    return Response(
+                        {
+                            "code": (
+                                "MFA code has already been used."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            
+
+            # ==================================================
+            # DISABLE MFA
+            # ==================================================
+
+            locked_user.mfa_enabled = False
+            locked_user.mfa_secret = None
+            locked_user.mfa_verified_at = None
+            locked_user.mfa_last_used_counter = None
+
+            locked_user.save(
+                update_fields=[
+                    "mfa_enabled",
+                    "mfa_secret",
+                    "mfa_verified_at",
+                    "mfa_last_used_counter",
+                ]
+            )
+
+            # ==================================================
+            # INVALIDATE ALL RECOVERY CODES
+            # ==================================================
+
+            MFARecoveryCode.objects.filter(
+                user=locked_user
+            ).delete()
+
+        # ======================================================
+        # AUDIT SUCCESS
+        # ======================================================
+
+        create_audit_log(
+            request,
+            "MFA_DISABLED",
+            (
+                f"MFA desativado para "
+                f"{user.username}."
+            ),
+            status_code=200,
+            result="SUCCESS",
+        )
+
+        return Response(
+            {
+                "message": (
+                    "MFA disabled successfully."
+                )
+            },
+            status=status.HTTP_200_OK,
         )
 # ============================================================
 # ALTERAR PASSWORD

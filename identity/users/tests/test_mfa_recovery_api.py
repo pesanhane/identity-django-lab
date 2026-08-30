@@ -13,11 +13,15 @@ from users.models import (
     AuditLog,
     MFARecoveryCode,
 )
-from users.mfa import generate_secret
+from users.mfa import (
+    generate_secret,
+    verify_totp_code_with_counter,
+)
 
 from users.mfa_recovery import (
     generate_recovery_codes,
     verify_and_consume_recovery_code,
+    
 )
 
 
@@ -49,6 +53,9 @@ class MFARecoveryAPITest(APITestCase):
         self.recovery_codes_url = (
             "/api/users/me/mfa/recovery-codes/"
         )
+        self.mfa_disable_url = (
+            "/api/users/me/mfa/disable/"
+        )        
 
     def tearDown(self):
         cache.clear()
@@ -921,4 +928,418 @@ class MFARecoveryAPITest(APITestCase):
 
         self.assertIsNotNone(
             regeneration_audit
+        )
+    def test_mfa_can_be_disabled_with_password_and_totp(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        generate_recovery_codes(
+            self.user
+        )
+
+        code = self.current_totp_code()
+
+        response = self.client.post(
+            self.mfa_disable_url,
+            {
+                "password": "TestPassword123!",
+                "code": code,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.user.refresh_from_db()
+
+        self.assertFalse(
+            self.user.mfa_enabled
+        )
+
+        self.assertIsNone(
+            self.user.mfa_secret
+        )
+
+        self.assertIsNone(
+            self.user.mfa_verified_at
+        )
+
+        self.assertIsNone(
+            self.user.mfa_last_used_counter
+        )
+
+        self.assertEqual(
+            MFARecoveryCode.objects.filter(
+                user=self.user
+            ).count(),
+            0,
+        )
+    def test_mfa_disable_rejects_wrong_password(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        response = self.client.post(
+            self.mfa_disable_url,
+            {
+                "password": "WrongPassword123!",
+                "code": self.current_totp_code(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            response.data,
+        )
+
+        self.user.refresh_from_db()
+
+        self.assertTrue(
+            self.user.mfa_enabled
+        )
+
+    def test_mfa_disable_rejects_invalid_totp(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        response = self.client.post(
+            self.mfa_disable_url,
+            {
+                "password": "TestPassword123!",
+                "code": "000000",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            response.data,
+        )
+
+        self.user.refresh_from_db()
+
+        self.assertTrue(
+            self.user.mfa_enabled
+        )
+
+    def test_mfa_disable_requires_password(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        response = self.client.post(
+            self.mfa_disable_url,
+            {
+                "code": self.current_totp_code(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            response.data,
+        )
+
+        self.assertIn(
+            "password",
+            response.data,
+        )
+    def test_mfa_disable_requires_totp(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        response = self.client.post(
+            self.mfa_disable_url,
+            {
+                "password": "TestPassword123!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            response.data,
+        )
+
+        self.assertIn(
+            "code",
+            response.data,
+        )
+
+    def test_mfa_disable_requires_authentication(self):
+
+        self.enable_mfa()
+
+        response = self.client.post(
+            self.mfa_disable_url,
+            {
+                "password": "TestPassword123!",
+                "code": self.current_totp_code(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401,
+            response.data,
+        )
+    def test_successful_mfa_disable_is_audited(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        response = self.client.post(
+            self.mfa_disable_url,
+            {
+                "password": "TestPassword123!",
+                "code": self.current_totp_code(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        audit = AuditLog.objects.filter(
+            user=self.user,
+            action="MFA_DISABLED",
+        ).first()
+
+        self.assertIsNotNone(
+            audit
+        )
+
+        self.assertEqual(
+            audit.result,
+            "SUCCESS",
+        )
+
+        self.assertEqual(
+            audit.status_code,
+            200,
+        )
+    def test_mfa_disable_rejects_replayed_totp(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        code = self.current_totp_code()
+
+        # Primeiro consumo do TOTP:
+        # simulamos que este código já foi usado anteriormente.
+        self.user.refresh_from_db()
+
+        counter = verify_totp_code_with_counter(
+            self.user.mfa_secret,
+            code,
+        )
+
+        self.assertIsNotNone(
+            counter
+        )
+
+        self.user.mfa_last_used_counter = counter
+        self.user.save(
+            update_fields=[
+                "mfa_last_used_counter"
+            ]
+        )
+
+        # Tentativa de reutilizar exatamente o mesmo TOTP
+        response = self.client.post(
+            self.mfa_disable_url,
+            {
+                "password": "TestPassword123!",
+                "code": code,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            response.data,
+        )
+
+        self.assertIn(
+            "code",
+            response.data,
+        )
+
+        self.user.refresh_from_db()
+
+        # MFA deve continuar ativo
+        self.assertTrue(
+            self.user.mfa_enabled
+        )
+
+        # O secret também não pode ter sido apagado
+        self.assertIsNotNone(
+            self.user.mfa_secret
+        )
+
+        # Deve existir auditoria específica de replay
+        audit = AuditLog.objects.filter(
+            user=self.user,
+            action="MFA_DISABLE_REPLAY_DETECTED",
+        ).first()
+
+        self.assertIsNotNone(
+            audit
+        )
+
+        self.assertEqual(
+            audit.result,
+            "FAILURE",
+        )
+
+        self.assertEqual(
+            audit.status_code,
+            400,
+        )
+
+    @patch.dict(
+        os.environ,
+        {
+            "MFA_RATE_LIMIT_USER": "2",
+            "MFA_RATE_LIMIT_IP": "100",
+            "RATE_LIMIT_WINDOW": "60",
+            "RATE_LIMIT_BLOCK": "300",
+        },
+        clear=False,
+    )
+    def test_mfa_disable_rate_limit_returns_429(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        payload = {
+            "password": "WrongPassword123!",
+            "code": self.current_totp_code(),
+        }
+
+        response1 = self.client.post(
+            self.mfa_disable_url,
+            payload,
+            format="json",
+        )
+
+        self.assertEqual(
+            response1.status_code,
+            400,
+            response1.data,
+        )
+
+        response2 = self.client.post(
+            self.mfa_disable_url,
+            payload,
+            format="json",
+        )
+
+        self.assertEqual(
+            response2.status_code,
+            400,
+            response2.data,
+        )
+
+        response3 = self.client.post(
+            self.mfa_disable_url,
+            payload,
+            format="json",
+        )
+
+        self.assertEqual(
+            response3.status_code,
+            429,
+            response3.data,
+        )
+
+        self.user.refresh_from_db()
+
+        self.assertTrue(
+            self.user.mfa_enabled
+        )
+
+    @patch.dict(
+        os.environ,
+        {
+            "MFA_RATE_LIMIT_USER": "2",
+            "MFA_RATE_LIMIT_IP": "100",
+            "RATE_LIMIT_WINDOW": "60",
+            "RATE_LIMIT_BLOCK": "300",
+        },
+        clear=False,
+    )
+    def test_rate_limited_mfa_disable_is_audited(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        payload = {
+            "password": "WrongPassword123!",
+            "code": self.current_totp_code(),
+        }
+
+        self.client.post(
+            self.mfa_disable_url,
+            payload,
+            format="json",
+        )
+
+        self.client.post(
+            self.mfa_disable_url,
+            payload,
+            format="json",
+        )
+
+        response = self.client.post(
+            self.mfa_disable_url,
+            payload,
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            429,
+            response.data,
+        )
+
+        audit = AuditLog.objects.filter(
+            user=self.user,
+            action="MFA_DISABLE_RATE_LIMITED",
+        ).first()
+
+        self.assertIsNotNone(
+            audit
+        )
+
+        self.assertEqual(
+            audit.result,
+            "FAILURE",
+        )
+
+        self.assertEqual(
+            audit.status_code,
+            429,
+        )
+
+        self.assertEqual(
+            audit.endpoint,
+            self.mfa_disable_url,
         )

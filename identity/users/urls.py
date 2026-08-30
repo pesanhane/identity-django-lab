@@ -18,6 +18,7 @@ from .views import (
     MFASetupView,
     MFAVerifyView,
     MFARecoveryCodesView,
+    MFADisableView,
 )
 
 
@@ -143,5 +144,11 @@ path(
     "me/mfa/recovery-codes/",
     MFARecoveryCodesView.as_view(),
     name="mfa-recovery-codes"
+),
+
+path(
+    "me/mfa/disable/",
+    MFADisableView.as_view(),
+    name="mfa-disable",
 ),
 ]
