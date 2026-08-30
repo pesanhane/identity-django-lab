@@ -1,9 +1,11 @@
 
 import os
+import pyotp
 
 from unittest.mock import patch
 from django.core.cache import cache
 from rest_framework.test import APITestCase
+
 
 from users.models import (
     User,
@@ -12,7 +14,11 @@ from users.models import (
     MFARecoveryCode,
 )
 from users.mfa import generate_secret
-from users.mfa_recovery import generate_recovery_codes
+
+from users.mfa_recovery import (
+    generate_recovery_codes,
+    verify_and_consume_recovery_code,
+)
 
 
 class MFARecoveryAPITest(APITestCase):
@@ -336,19 +342,54 @@ class MFARecoveryAPITest(APITestCase):
             response.data,
         )
 
+
     def test_regeneration_invalidates_old_recovery_codes(self):
+
+        # ==========================================================
+        # AUTENTICAR ANTES DE ATIVAR MFA
+        # ==========================================================
+
+        self.authenticate()
+
+        # ==========================================================
+        # ATIVAR MFA
+        # ==========================================================
+
         self.enable_mfa()
-        self.client.force_authenticate(
-            user=self.user
-        )
+
+        # ==========================================================
+        # PRIMEIRO CONJUNTO DE RECOVERY CODES
+        # ==========================================================
 
         old_codes = generate_recovery_codes(
             self.user
         )
 
+        old_code = old_codes[0]
+
+        self.assertEqual(
+            MFARecoveryCode.objects.filter(
+                user=self.user
+            ).count(),
+            10,
+        )
+
+        # ==========================================================
+        # GERAR TOTP VÁLIDO
+        # ==========================================================
+
+        totp_code = self.current_totp_code()
+
+        # ==========================================================
+        # REGENERAR VIA API COM REAUTENTICAÇÃO FORTE
+        # ==========================================================
+
         response = self.client.post(
             self.recovery_codes_url,
-            {},
+            {
+                "password": "TestPassword123!",
+                "code": totp_code,
+            },
             format="json",
         )
 
@@ -358,31 +399,62 @@ class MFARecoveryAPITest(APITestCase):
             response.data,
         )
 
-        self.client.force_authenticate(
-            user=None
-        )
+        # ==========================================================
+        # NOVO CONJUNTO
+        # ==========================================================
 
-        response = self.client.post(
-            self.recovery_token_url,
-            {
-                "username": self.user.username,
-                "password": "TestPassword123!",
-                "recovery_code": old_codes[0],
-            },
-            format="json",
-        )
+        new_codes = response.data[
+            "recovery_codes"
+        ]
 
         self.assertEqual(
-            response.status_code,
-            400,
-            response.data,
+            len(new_codes),
+            10,
+        )
+
+        self.assertNotEqual(
+            old_codes,
+            new_codes,
+        )
+
+        # ==========================================================
+        # CÓDIGO ANTIGO DEVE ESTAR INVALIDADO
+        # ==========================================================
+
+        self.assertFalse(
+            verify_and_consume_recovery_code(
+                self.user,
+                old_code,
+            )
+        )
+
+        # ==========================================================
+        # NOVO CÓDIGO DEVE FUNCIONAR
+        # ==========================================================
+
+        self.assertTrue(
+            verify_and_consume_recovery_code(
+                self.user,
+                new_codes[0],
+            )
+        )
+
+        # ==========================================================
+        # BANCO CONTINUA COM APENAS 10 CÓDIGOS
+        # ==========================================================
+
+        self.assertEqual(
+            MFARecoveryCode.objects.filter(
+                user=self.user
+            ).count(),
+            10,
         )
         # ==========================================================
     # RECOVERY LOGIN AUDIT
     # ==========================================================
 
     def test_successful_recovery_login_is_audited(self):
-
+        self.authenticate()
         self.enable_mfa()
 
         codes = generate_recovery_codes(
@@ -642,4 +714,211 @@ class MFARecoveryAPITest(APITestCase):
         self.assertEqual(
             audit.endpoint,
             self.recovery_token_url,
+        )
+    
+    def current_totp_code(self):
+
+        self.user.refresh_from_db()
+
+        return pyotp.TOTP(
+            self.user.mfa_secret
+        ).now()
+
+    
+    def test_regeneration_requires_current_password(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        generate_recovery_codes(
+            self.user
+        )
+
+        response = self.client.post(
+            self.recovery_codes_url,
+            {
+                "code": self.current_totp_code(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            response.data,
+        )
+
+        self.assertIn(
+            "password",
+            response.data,
+        )
+
+    def test_regeneration_requires_totp_code(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        generate_recovery_codes(
+            self.user
+        )
+
+        response = self.client.post(
+            self.recovery_codes_url,
+            {
+                "password": "TestPassword123!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            response.data,
+        )
+
+        self.assertIn(
+            "code",
+            response.data,
+        )
+    def test_regeneration_rejects_wrong_password(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        generate_recovery_codes(
+            self.user
+        )
+
+        response = self.client.post(
+            self.recovery_codes_url,
+            {
+                "password": "WrongPassword123!",
+                "code": self.current_totp_code(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            response.data,
+        )
+
+        self.assertIn(
+            "password",
+            response.data,
+        )
+
+    def test_regeneration_rejects_invalid_totp(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        generate_recovery_codes(
+            self.user
+        )
+
+        response = self.client.post(
+            self.recovery_codes_url,
+            {
+                "password": "TestPassword123!",
+                "code": "000000",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            400,
+            response.data,
+        )
+
+        self.assertIn(
+            "code",
+            response.data,
+        )
+    def test_regeneration_with_password_and_totp_succeeds(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        old_codes = generate_recovery_codes(
+            self.user
+        )
+
+        code = self.current_totp_code()
+
+        response = self.client.post(
+            self.recovery_codes_url,
+            {
+                "password": "TestPassword123!",
+                "code": code,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.assertEqual(
+            len(
+                response.data[
+                    "recovery_codes"
+                ]
+            ),
+            10,
+        )
+
+        new_codes = response.data[
+            "recovery_codes"
+        ]
+
+        self.assertNotEqual(
+            old_codes,
+            new_codes,
+        )
+
+    def test_successful_recovery_regeneration_is_audited(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        generate_recovery_codes(
+            self.user
+        )
+
+        response = self.client.post(
+            self.recovery_codes_url,
+            {
+                "password": "TestPassword123!",
+                "code": self.current_totp_code(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        reauth_audit = AuditLog.objects.filter(
+            user=self.user,
+            action="MFA_RECOVERY_REAUTH_SUCCESS",
+        ).first()
+
+        self.assertIsNotNone(
+            reauth_audit
+        )
+
+        regeneration_audit = AuditLog.objects.filter(
+            user=self.user,
+            action="MFA_RECOVERY_CODES_REGENERATED",
+        ).first()
+
+        self.assertIsNotNone(
+            regeneration_audit
         )

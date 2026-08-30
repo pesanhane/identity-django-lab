@@ -5,12 +5,18 @@ from django.utils import timezone
 
 from .rbac import DynamicPermission
 
+
+from .mfa import verify_totp_code_with_counter
+
+
+
 from .models import (
     User,
     AuditLog,
     Role,
     Permission,
     Group,
+    MFARecoveryCode,
 )
 
 from .serializers import (
@@ -1171,26 +1177,303 @@ class MFARecoveryCodesView(APIView):
 
         user = request.user
 
+        # ======================================================
+        # MFA MUST BE ENABLED
+        # ======================================================
+
         if not user.mfa_enabled:
+
             return Response(
                 {
-                    "error": "MFA must be enabled before generating recovery codes."
+                    "error": (
+                        "MFA must be enabled before "
+                        "generating recovery codes."
+                    )
                 },
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
-        codes = generate_recovery_codes(user)
+        # ======================================================
+        # CHECK IF THIS IS A REGENERATION
+        # ======================================================
+
+        has_existing_codes = (
+            MFARecoveryCode.objects
+            .filter(user=user)
+            .exists()
+        )
+
+        # ======================================================
+        # STRONG REAUTHENTICATION FOR REGENERATION
+        # ======================================================
+
+        if has_existing_codes:
+
+            password = request.data.get(
+                "password"
+            )
+
+            code = request.data.get(
+                "code"
+            )
+
+            # --------------------------------------------------
+            # PASSWORD REQUIRED
+            # --------------------------------------------------
+
+            if not password:
+
+                create_audit_log(
+                    request,
+                    "MFA_RECOVERY_REAUTH_FAILED",
+                    (
+                        "Regeneração de recovery codes "
+                        "recusada: password ausente."
+                    ),
+                    status_code=400,
+                    result="FAILURE",
+                )
+
+                return Response(
+                    {
+                        "password": (
+                            "Current password is required "
+                            "to regenerate recovery codes."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # --------------------------------------------------
+            # TOTP REQUIRED
+            # --------------------------------------------------
+
+            if not code:
+
+                create_audit_log(
+                    request,
+                    "MFA_RECOVERY_REAUTH_FAILED",
+                    (
+                        "Regeneração de recovery codes "
+                        "recusada: código MFA ausente."
+                    ),
+                    status_code=400,
+                    result="FAILURE",
+                )
+
+                return Response(
+                    {
+                        "code": (
+                            "MFA code is required to "
+                            "regenerate recovery codes."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # --------------------------------------------------
+            # USER LOCK
+            # --------------------------------------------------
+
+            with transaction.atomic():
+
+                locked_user = (
+                    User.objects
+                    .select_for_update()
+                    .get(pk=user.pk)
+                )
+
+                # ----------------------------------------------
+                # PASSWORD VALIDATION
+                # ----------------------------------------------
+
+                if not locked_user.check_password(
+                    password
+                ):
+
+                    create_audit_log(
+                        request,
+                        "MFA_RECOVERY_REAUTH_FAILED",
+                        (
+                            "Regeneração de recovery codes "
+                            "recusada: password inválida."
+                        ),
+                        status_code=400,
+                        result="FAILURE",
+                    )
+
+                    return Response(
+                        {
+                            "password": (
+                                "Invalid current password."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                # ----------------------------------------------
+                # MFA SECRET CHECK
+                # ----------------------------------------------
+
+                if not locked_user.mfa_secret:
+
+                    create_audit_log(
+                        request,
+                        "MFA_RECOVERY_REAUTH_FAILED",
+                        (
+                            "Regeneração de recovery codes "
+                            "recusada: MFA sem secret."
+                        ),
+                        status_code=400,
+                        result="FAILURE",
+                    )
+
+                    return Response(
+                        {
+                            "code": (
+                                "MFA configuration is invalid."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                # ----------------------------------------------
+                # TOTP VALIDATION
+                # ----------------------------------------------
+
+                counter = (
+                    verify_totp_code_with_counter(
+                        locked_user.mfa_secret,
+                        code,
+                    )
+                )
+
+                if counter is None:
+
+                    create_audit_log(
+                        request,
+                        "MFA_RECOVERY_REAUTH_FAILED",
+                        (
+                            "Regeneração de recovery codes "
+                            "recusada: código MFA inválido."
+                        ),
+                        status_code=400,
+                        result="FAILURE",
+                    )
+
+                    return Response(
+                        {
+                            "code": (
+                                "Invalid MFA code."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                # ----------------------------------------------
+                # TOTP ANTI-REPLAY
+                # ----------------------------------------------
+
+                if (
+                    locked_user.mfa_last_used_counter
+                    is not None
+                    and
+                    counter
+                    <=
+                    locked_user.mfa_last_used_counter
+                ):
+
+                    create_audit_log(
+                        request,
+                        "MFA_RECOVERY_REAUTH_FAILED",
+                        (
+                            "Regeneração de recovery codes "
+                            "recusada: código MFA reutilizado."
+                        ),
+                        status_code=400,
+                        result="FAILURE",
+                    )
+
+                    return Response(
+                        {
+                            "code": (
+                                "MFA code has already "
+                                "been used."
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+
+                # ----------------------------------------------
+                # CONSUME TOTP COUNTER
+                # ----------------------------------------------
+
+                locked_user.mfa_last_used_counter = (
+                    counter
+                )
+
+                locked_user.save(
+                    update_fields=[
+                        "mfa_last_used_counter"
+                    ]
+                )
+
+            # ==================================================
+            # REAUTH SUCCESS
+            # ==================================================
+
+            create_audit_log(
+                request,
+                "MFA_RECOVERY_REAUTH_SUCCESS",
+                (
+                    "Reautenticação forte concluída "
+                    "para regeneração de recovery codes."
+                ),
+                status_code=200,
+                result="SUCCESS",
+            )
+
+        # ======================================================
+        # GENERATE / REGENERATE
+        # ======================================================
+
+        codes = generate_recovery_codes(
+            user
+        )
+
+        action = (
+            "MFA_RECOVERY_CODES_REGENERATED"
+            if has_existing_codes
+            else
+            "MFA_RECOVERY_CODES_GENERATED"
+        )
+
+        description = (
+            f"Recovery codes regenerados para "
+            f"{user.username}"
+            if has_existing_codes
+            else
+            f"Recovery codes gerados para "
+            f"{user.username}"
+        )
 
         create_audit_log(
             request,
-            "MFA_RECOVERY_CODES_GENERATED",
-            f"Recovery codes gerados para {user.username}"
+            action,
+            description,
+            status_code=200,
+            result="SUCCESS",
         )
 
         return Response(
             {
-                "message": "Recovery codes generated successfully.",
+                "message": (
+                    "Recovery codes regenerated successfully."
+                    if has_existing_codes
+                    else
+                    "Recovery codes generated successfully."
+                ),
                 "recovery_codes": codes,
             },
-            status=status.HTTP_200_OK
+            status=status.HTTP_200_OK,
         )
