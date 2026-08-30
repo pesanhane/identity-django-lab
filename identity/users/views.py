@@ -780,6 +780,41 @@ class MFADisableView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class MFAStatusView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+
+        user = request.user
+
+        recovery_codes = (
+            MFARecoveryCode.objects
+            .filter(user=user)
+        )
+
+        total_codes = recovery_codes.count()
+
+        unused_codes = recovery_codes.filter(
+            used_at__isnull=True
+        ).count()
+
+        used_codes = total_codes - unused_codes
+
+        return Response(
+            {
+                "mfa_enabled": user.mfa_enabled,
+                "mfa_verified_at": user.mfa_verified_at,
+                "recovery_codes": {
+                    "total": total_codes,
+                    "unused": unused_codes,
+                    "used": used_codes,
+                },
+            },
+            status=status.HTTP_200_OK,
+        )
 # ============================================================
 # ALTERAR PASSWORD
 # ============================================================

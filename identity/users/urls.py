@@ -19,6 +19,7 @@ from .views import (
     MFAVerifyView,
     MFARecoveryCodesView,
     MFADisableView,
+    MFAStatusView,
 )
 
 
@@ -150,5 +151,11 @@ path(
     "me/mfa/disable/",
     MFADisableView.as_view(),
     name="mfa-disable",
+),
+
+path(
+    "me/mfa/status/",
+    MFAStatusView.as_view(),
+    name="mfa-status",
 ),
 ]

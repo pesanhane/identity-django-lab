@@ -25,6 +25,7 @@ from users.mfa_recovery import (
 )
 
 
+
 class MFARecoveryAPITest(APITestCase):
 
     def setUp(self):
@@ -55,7 +56,8 @@ class MFARecoveryAPITest(APITestCase):
         )
         self.mfa_disable_url = (
             "/api/users/me/mfa/disable/"
-        )        
+        )  
+        self.mfa_status_url = "/api/users/me/mfa/status/"      
 
     def tearDown(self):
         cache.clear()
@@ -1343,3 +1345,182 @@ class MFARecoveryAPITest(APITestCase):
             audit.endpoint,
             self.mfa_disable_url,
         )
+
+    def test_mfa_status_requires_authentication(self):
+
+        response = self.client.get(
+            self.mfa_status_url
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401,
+            response.data,
+        )
+    def test_mfa_status_when_mfa_is_disabled(self):
+
+        self.authenticate()
+
+        response = self.client.get(
+            self.mfa_status_url
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.assertFalse(
+            response.data["mfa_enabled"]
+        )
+
+        self.assertIsNone(
+            response.data["mfa_verified_at"]
+        )
+
+        self.assertEqual(
+            response.data["recovery_codes"]["total"],
+            0,
+        )
+
+        self.assertEqual(
+            response.data["recovery_codes"]["unused"],
+            0,
+        )
+
+        self.assertEqual(
+            response.data["recovery_codes"]["used"],
+            0,
+        )
+
+    def test_mfa_status_returns_recovery_code_counts(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        generate_recovery_codes(
+            self.user,
+            count=10,
+        )
+
+        response = self.client.get(
+            self.mfa_status_url
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.assertTrue(
+            response.data["mfa_enabled"]
+        )
+
+        self.assertEqual(
+            response.data["recovery_codes"]["total"],
+            10,
+        )
+
+        self.assertEqual(
+            response.data["recovery_codes"]["unused"],
+            10,
+        )
+
+        self.assertEqual(
+            response.data["recovery_codes"]["used"],
+            0,
+        )
+    def test_mfa_status_counts_used_recovery_codes(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        codes = generate_recovery_codes(
+            self.user,
+            count=10,
+        )
+
+        consumed = (
+            verify_and_consume_recovery_code(
+                self.user,
+                codes[0],
+            )
+        )
+
+        self.assertTrue(consumed)
+
+        response = self.client.get(
+            self.mfa_status_url
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.assertEqual(
+            response.data["recovery_codes"]["total"],
+            10,
+        )
+
+        self.assertEqual(
+            response.data["recovery_codes"]["unused"],
+            9,
+        )
+
+        self.assertEqual(
+            response.data["recovery_codes"]["used"],
+            1,
+        )
+
+    def test_mfa_status_does_not_expose_sensitive_data(self):
+
+        self.authenticate()
+        self.enable_mfa()
+
+        codes = generate_recovery_codes(
+            self.user,
+            count=10,
+        )
+
+        response = self.client.get(
+            self.mfa_status_url
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.assertNotIn(
+            "mfa_secret",
+            response.data,
+        )
+
+        self.assertNotIn(
+            "recovery_code",
+            response.data,
+        )
+
+        self.assertNotIn(
+            "codes",
+            response.data,
+        )
+
+        response_text = str(response.data)
+
+        self.assertNotIn(
+            self.user.mfa_secret,
+            response_text,
+        )
+
+        for code in codes:
+
+            self.assertNotIn(
+                code,
+                response_text,
+            )
