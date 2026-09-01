@@ -1442,6 +1442,140 @@ class UserSessionAuthenticationTest(APITestCase):
             200,
         )
 
+    def test_refresh_rejected_when_jti_does_not_match_session(
+        self
+    ):
+
+        login_response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        refresh = login_response.data[
+            "refresh"
+        ]
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        # Simula inconsistência entre a sessão
+        # armazenada e o refresh apresentado.
+        session.jti = "different-session-jti"
+
+        session.save(
+            update_fields=[
+                "jti"
+            ]
+        )
+
+        response = self.client.post(
+            "/api/token/refresh/",
+            {
+                "refresh": refresh,
+            },
+            format="json",
+        )
+
+        self.assertIn(
+            response.status_code,
+            [
+                status.HTTP_400_BAD_REQUEST,
+                status.HTTP_401_UNAUTHORIZED,
+            ],
+        )
+
+        session.refresh_from_db()
+
+        # O refresh rejeitado não pode alterar
+        # novamente o JTI da sessão.
+        self.assertEqual(
+            session.jti,
+            "different-session-jti",
+        )
+
+    def test_revoked_session_refresh_does_not_modify_session(
+        self
+    ):
+
+        login_response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        refresh = login_response.data[
+            "refresh"
+        ]
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        original_jti = session.jti
+        original_expires_at = session.expires_at
+
+        session.revoked_at = timezone.now()
+
+        session.save(
+            update_fields=[
+                "revoked_at"
+            ]
+        )
+
+        response = self.client.post(
+            "/api/token/refresh/",
+            {
+                "refresh": refresh,
+            },
+            format="json",
+        )
+
+        self.assertIn(
+            response.status_code,
+            [
+                status.HTTP_400_BAD_REQUEST,
+                status.HTTP_401_UNAUTHORIZED,
+            ],
+        )
+
+        session.refresh_from_db()
+
+        self.assertEqual(
+            session.jti,
+            original_jti,
+        )
+
+        self.assertEqual(
+            session.expires_at,
+            original_expires_at,
+        )
+
+        self.assertIsNotNone(
+            session.revoked_at
+        )
+
 class UserSessionMFAAuthenticationTest(APITestCase):
 
     def setUp(self):

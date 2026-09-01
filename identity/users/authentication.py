@@ -9,6 +9,11 @@ from rest_framework_simplejwt.views import (
     TokenRefreshView,
 )
 
+from rest_framework_simplejwt.exceptions import (
+    InvalidToken,
+    TokenError,
+)
+
 from .mfa import verify_totp_code_with_counter
 
 from .mfa_recovery import (
@@ -36,11 +41,19 @@ from rest_framework_simplejwt.serializers import (
     TokenObtainPairSerializer,
 )
 
+from datetime import datetime, timezone as dt_timezone
+
+from django.db import transaction
+
+from rest_framework import serializers
+
+
+
+
 from rest_framework_simplejwt.exceptions import (
     InvalidToken,
 )
 
-from datetime import datetime, timezone as dt_timezone
 from django.utils import timezone
 
 from rest_framework.exceptions import AuthenticationFailed
@@ -729,63 +742,223 @@ class SessionTokenRefreshSerializer(
     TokenRefreshSerializer
 ):
 
+    @transaction.atomic
     def validate(self, attrs):
 
-        old_refresh = RefreshToken(
-            attrs["refresh"]
+        raw_refresh_token = attrs.get(
+            "refresh"
         )
 
-        session_id = old_refresh.get(
+        if not raw_refresh_token:
+
+            raise serializers.ValidationError(
+                {
+                    "refresh": (
+                        "Refresh token is required."
+                    )
+                }
+            )
+
+        # ========================================================
+        # PARSE TOKEN BEFORE REFRESH / ROTATION
+        # ========================================================
+        #
+        # Neste ponto apenas validamos e inspecionamos
+        # o refresh existente.
+        #
+        # Ainda NÃO chamamos super().validate(attrs),
+        # portanto nenhuma rotação acontece aqui.
+        # ========================================================
+
+        refresh = RefreshToken(
+            raw_refresh_token
+        )
+
+        session_id = refresh.get(
             "session_id"
         )
 
-        data = super().validate(attrs)
+        token_user_id = refresh.get(
+            "user_id"
+        )
 
-        # Compatibilidade temporária com tokens antigos
-        # que ainda não possuem session_id.
+        # ========================================================
+        # LEGACY TOKEN COMPATIBILITY
+        # ========================================================
+        #
+        # Por enquanto mantemos compatibilidade
+        # com refresh tokens antigos que ainda
+        # não possuem session_id.
+        #
+        # Numa fase posterior podemos remover
+        # este bloco e tornar session_id obrigatório.
+        # ========================================================
+
         if not session_id:
-            return data
+
+            return super().validate(
+                attrs
+            )
+
+        # ========================================================
+        # LOAD AND LOCK SESSION
+        # ========================================================
 
         try:
-            session = UserSession.objects.get(
-                id=session_id
+
+            session = (
+                UserSession.objects
+                .select_for_update()
+                .get(
+                    id=session_id,
+                )
             )
-        except UserSession.DoesNotExist:
+
+        except (
+            UserSession.DoesNotExist,
+            ValueError,
+        ):
+
             raise InvalidToken(
                 "Session does not exist."
             )
 
+        # ========================================================
+        # SESSION MUST BELONG TO TOKEN USER
+        # ========================================================
+
+        if str(session.user_id) != str(
+            token_user_id
+        ):
+
+            raise InvalidToken(
+                "Session does not belong to this token."
+            )
+
+        # ========================================================
+        # REVOKED SESSION
+        # ========================================================
+
         if session.revoked_at is not None:
+
             raise InvalidToken(
                 "Session has been revoked."
             )
 
-        new_refresh = data.get("refresh")
+        # ========================================================
+        # SESSION EXPIRATION
+        # ========================================================
 
-        if new_refresh:
+        if session.expires_at <= timezone.now():
 
-            refresh = RefreshToken(
-                new_refresh
+            raise InvalidToken(
+                "Session has expired."
             )
 
-            refresh["session_id"] = str(
+        # ========================================================
+        # JTI CONSISTENCY
+        # ========================================================
+        #
+        # O refresh apresentado deve ser exatamente
+        # o refresh atualmente associado à sessão.
+        #
+        # Isso impede que um refresh antigo da mesma
+        # sessão seja reutilizado depois da rotação.
+        # ========================================================
+
+        current_jti = str(
+            refresh.get("jti")
+        )
+
+        if session.jti != current_jti:
+
+            raise InvalidToken(
+                "Refresh token does not match "
+                "the active session."
+            )
+
+        # ========================================================
+        # SIMPLEJWT REFRESH / ROTATION
+        # ========================================================
+        #
+        # SOMENTE AGORA permitimos que SimpleJWT:
+        #
+        # - gere access token;
+        # - faça blacklist do refresh antigo;
+        # - faça rotação;
+        # - gere novo JTI;
+        #
+        # ========================================================
+
+        data = super().validate(
+            attrs
+        )
+
+        # ========================================================
+        # UPDATE SESSION AFTER ROTATION
+        # ========================================================
+
+        new_refresh_token = data.get(
+            "refresh"
+        )
+
+        if new_refresh_token:
+
+            try:
+
+                new_refresh = RefreshToken(
+                    new_refresh_token
+                )
+
+            except TokenError:
+
+                raise serializers.ValidationError(
+                    {
+                        "refresh": (
+                            "Unable to process "
+                            "rotated refresh token."
+                        )
+                    }
+                )
+
+            new_session_id = new_refresh.get(
+                "session_id"
+            )
+
+            # Defesa adicional:
+            # a rotação nunca deve alterar session_id.
+
+            if str(new_session_id) != str(
                 session.id
+            ):
+
+                raise serializers.ValidationError(
+                    {
+                        "refresh": (
+                            "Invalid session binding "
+                            "after token rotation."
+                        )
+                    }
+                )
+
+            new_jti = str(
+                new_refresh["jti"]
             )
 
-            access = refresh.access_token
-
-            data["refresh"] = str(refresh)
-            data["access"] = str(access)
-
-            session.jti = str(
-                refresh["jti"]
+            new_exp = int(
+                new_refresh["exp"]
             )
 
-            session.expires_at = (
+            new_expires_at = (
                 datetime.fromtimestamp(
-                    int(refresh["exp"]),
+                    new_exp,
                     tz=dt_timezone.utc,
                 )
+            )
+
+            session.jti = new_jti
+            session.expires_at = (
+                new_expires_at
             )
 
             session.save(
@@ -795,19 +968,6 @@ class SessionTokenRefreshSerializer(
                     "last_activity",
                 ]
             )
-
-        else:
-            # Caso a configuração futura deixe
-            # de rotacionar refresh tokens.
-            access = AccessToken(
-                data["access"]
-            )
-
-            access["session_id"] = str(
-                session.id
-            )
-
-            data["access"] = str(access)
 
         return data
 
