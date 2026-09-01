@@ -54,6 +54,8 @@ from .mfa_recovery import generate_recovery_codes
 
 from .session_management import (
     blacklist_user_session,
+    revoke_user_session,
+    create_session_audit,
 )
 
 from rest_framework_simplejwt.exceptions import TokenError
@@ -879,7 +881,12 @@ class LogoutView(APIView):
             "refresh"
         )
 
+        # ============================================================
+        # REFRESH TOKEN REQUIRED
+        # ============================================================
+
         if not refresh_token:
+
             return Response(
                 {
                     "detail": (
@@ -891,23 +898,30 @@ class LogoutView(APIView):
 
         try:
 
+            # ========================================================
+            # VALIDATE REFRESH TOKEN
+            # ========================================================
+
             token = RefreshToken(
                 refresh_token
+            )
+
+            token_user_id = token.get(
+                "user_id"
             )
 
             session_id = token.get(
                 "session_id"
             )
 
-            # Garante que o refresh token pertence
-            # ao utilizador autenticado.
-            token_user_id = token.get(
-                "user_id"
-            )
+            # ========================================================
+            # TOKEN MUST BELONG TO AUTHENTICATED USER
+            # ========================================================
 
             if str(token_user_id) != str(
                 request.user.id
             ):
+
                 return Response(
                     {
                         "detail": (
@@ -918,25 +932,64 @@ class LogoutView(APIView):
                     status=status.HTTP_403_FORBIDDEN,
                 )
 
-            # Revoga o refresh token no
-            # mecanismo nativo do SimpleJWT.
-            token.blacklist()
+            # ========================================================
+            # SESSION REVOCATION
+            # ========================================================
 
-            # Tokens antigos podem não possuir
-            # session_id.
             if session_id:
 
-                UserSession.objects.filter(
-                    id=session_id,
-                    user=request.user,
-                    revoked_at__isnull=True,
-                ).update(
-                    revoked_at=timezone.now()
-                )
+                try:
 
-            # Auditoria do logout
-            # Auditoria apenas quando o utilizador
-            # pertence a uma organização.
+                    session = (
+                        UserSession.objects
+                        .get(
+                            id=session_id,
+                            user=request.user,
+                        )
+                    )
+
+                except (
+                    UserSession.DoesNotExist,
+                    ValueError,
+                ):
+
+                    session = None
+
+                if session is not None:
+
+                    revoke_user_session(
+                        session=session
+                    )
+
+                else:
+
+                    # O session_id existe no token,
+                    # mas a sessão já não existe.
+                    #
+                    # Mesmo assim, o refresh token
+                    # deve ser inutilizado.
+                    token.blacklist()
+
+            else:
+
+                # Compatibilidade temporária com
+                # refresh tokens antigos que ainda
+                # não possuem session_id.
+                token.blacklist()
+
+            # ========================================================
+            # LEGACY LOGOUT AUDIT
+            # ========================================================
+            #
+            # Mantemos LOGOUT porque existem testes
+            # e consumidores antigos que dependem
+            # deste evento.
+            #
+            # AuditLog requer organização.
+            # Utilizadores sem organização não devem
+            # ter o logout bloqueado pela auditoria.
+            # ========================================================
+
             if getattr(
                 request.user,
                 "organization",
@@ -955,13 +1008,41 @@ class LogoutView(APIView):
                     result="SUCCESS",
                 )
 
+            # ========================================================
+            # SESSION LIFECYCLE AUDIT
+            # ========================================================
+
+            create_session_audit(
+                request=request,
+                user=request.user,
+                action="SESSION_LOGOUT",
+                description=(
+                    "Sessão encerrada através "
+                    "de logout."
+                ),
+                status_code=200,
+                result="SUCCESS",
+            )
+
+            # ========================================================
+            # SUCCESS
+            # ========================================================
+
             return Response(
                 {
-                    "message": "Logout successful.",
-                    "detail": "Logout successful.",
+                    "message": (
+                        "Logout successful."
+                    ),
+                    "detail": (
+                        "Logout successful."
+                    ),
                 },
                 status=status.HTTP_200_OK,
             )
+
+        # ============================================================
+        # INVALID / EXPIRED / BLACKLISTED TOKEN
+        # ============================================================
 
         except TokenError:
 
@@ -974,6 +1055,10 @@ class LogoutView(APIView):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # ============================================================
+        # INVALID SESSION ID / TOKEN DATA
+        # ============================================================
 
         except (
             ValueError,
@@ -2021,17 +2106,23 @@ class UserSessionRevokeView(APIView):
 
         if session.revoked_at is None:
 
-            blacklist_user_session(
-                session
+            revoked = revoke_user_session(
+                session=session
             )
 
-            session.revoked_at = timezone.now()
+            if revoked:
 
-            session.save(
-                update_fields=[
-                    "revoked_at",
-                ]
-            )
+                create_session_audit(
+                    request=request,
+                    user=request.user,
+                    action="SESSION_REVOKED",
+                    description=(
+                        f"Sessão {session.id} "
+                        f"revogada pelo utilizador."
+                    ),
+                    status_code=200,
+                    result="SUCCESS",
+                )
 
         return Response(
             {
@@ -2071,26 +2162,27 @@ class UserSessionRevokeAllView(APIView):
                 id=session_id
             )
 
-        now = timezone.now()
-
         revoked_count = 0
 
         for session in sessions:
 
-            blacklist_user_session(
-                session
-            )
+            if revoke_user_session(
+                session=session
+            ):
+                revoked_count += 1
 
-            session.revoked_at = now
-
-            session.save(
-                update_fields=[
-                    "revoked_at",
-                ]
-            )
-
-            revoked_count += 1
-
+        create_session_audit(
+            request=request,
+            user=request.user,
+            action="SESSIONS_REVOKED_ALL",
+            description=(
+                f"{revoked_count} sessão(ões) "
+                f"revogada(s). "
+                f"keep_current={keep_current}."
+            ),
+            status_code=200,
+            result="SUCCESS",
+        )
         return Response(
             {
                 "detail": (

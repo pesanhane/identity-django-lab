@@ -1,5 +1,15 @@
 from rest_framework.test import APITestCase
-from users.models import User, UserSession
+
+from rest_framework import status
+
+
+from users.models import (
+    User,
+    UserSession,
+    AuditLog,
+    Organization,
+)
+
 import pyotp
 
 from django.core.cache import cache
@@ -1615,6 +1625,295 @@ class UserSessionMFAAuthenticationTest(APITestCase):
             UserSession.objects.filter(
                 user=self.user
             ).exists()
+        )
+
+
+class UserSessionLifecycleAuditTest(APITestCase):
+
+    def setUp(self):
+
+        self.organization = Organization.objects.create(
+            name="Audit Organization",
+            description="Organization for session audit tests",
+        )
+
+        self.user = User.objects.create_user(
+            username="sessionaudit",
+            email="sessionaudit@example.com",
+            password="TestPassword123!",
+            organization=self.organization,
+        )
+
+        self.password = "TestPassword123!"
+
+        self.login_url = "/api/token/"
+        self.sessions_url = "/api/users/me/sessions/"
+        self.revoke_all_url = (
+            "/api/users/me/sessions/revoke-all/"
+        )
+        self.logout_url = "/api/users/logout/"
+
+    def login(self):
+
+        response = self.client.post(
+            self.login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        return response
+
+    def authenticate_with_access(
+        self,
+        access_token,
+    ):
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access_token}"
+            )
+        )
+
+    # ============================================================
+    # SESSION_CREATED
+    # ============================================================
+
+    def test_session_created_is_audited(self):
+
+        self.login()
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=self.user,
+                organization=self.organization,
+                action="SESSION_CREATED",
+                result="SUCCESS",
+            ).exists()
+        )
+
+    # ============================================================
+    # SESSION_REVOKED
+    # ============================================================
+
+    def test_session_revoked_is_audited(self):
+
+        login_response = self.login()
+
+        access = login_response.data[
+            "access"
+        ]
+
+        self.authenticate_with_access(
+            access
+        )
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        response = self.client.delete(
+            f"/api/users/me/sessions/{session.id}/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=self.user,
+                organization=self.organization,
+                action="SESSION_REVOKED",
+                result="SUCCESS",
+            ).exists()
+        )
+
+    # ============================================================
+    # SESSIONS_REVOKED_ALL
+    # ============================================================
+
+    def test_sessions_revoke_all_is_audited(self):
+
+        first_login = self.login()
+        second_login = self.login()
+
+        access = second_login.data[
+            "access"
+        ]
+
+        self.authenticate_with_access(
+            access
+        )
+
+        response = self.client.post(
+            self.revoke_all_url,
+            {
+                "keep_current": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=self.user,
+                organization=self.organization,
+                action="SESSIONS_REVOKED_ALL",
+                result="SUCCESS",
+            ).exists()
+        )
+
+    # ============================================================
+    # SESSION_LOGOUT
+    # ============================================================
+
+    def test_session_logout_is_audited(self):
+
+        login_response = self.login()
+
+        access = login_response.data[
+            "access"
+        ]
+
+        refresh = login_response.data[
+            "refresh"
+        ]
+
+        self.authenticate_with_access(
+            access
+        )
+
+        response = self.client.post(
+            self.logout_url,
+            {
+                "refresh": refresh,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=self.user,
+                organization=self.organization,
+                action="SESSION_LOGOUT",
+                result="SUCCESS",
+            ).exists()
+        )
+
+    # ============================================================
+    # LEGACY LOGOUT AUDIT
+    # ============================================================
+
+    def test_session_logout_preserves_legacy_logout_audit(self):
+
+        login_response = self.login()
+
+        access = login_response.data[
+            "access"
+        ]
+
+        refresh = login_response.data[
+            "refresh"
+        ]
+
+        self.authenticate_with_access(
+            access
+        )
+
+        response = self.client.post(
+            self.logout_url,
+            {
+                "refresh": refresh,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=self.user,
+                organization=self.organization,
+                action="LOGOUT",
+            ).exists()
+        )
+
+    # ============================================================
+    # USER WITHOUT ORGANIZATION
+    # ============================================================
+
+    def test_session_audit_does_not_break_user_without_organization(
+        self
+    ):
+
+        user_without_org = User.objects.create_user(
+            username="session-no-org",
+            email="session-no-org@example.com",
+            password="TestPassword123!",
+        )
+
+        response = self.client.post(
+            self.login_url,
+            {
+                "username": user_without_org.username,
+                "password": "TestPassword123!",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        access = response.data[
+            "access"
+        ]
+
+        refresh = response.data[
+            "refresh"
+        ]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        logout_response = self.client.post(
+            self.logout_url,
+            {
+                "refresh": refresh,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            logout_response.status_code,
+            status.HTTP_200_OK,
         )
 
     
