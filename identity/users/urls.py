@@ -20,6 +20,9 @@ from .views import (
     MFARecoveryCodesView,
     MFADisableView,
     MFAStatusView,
+    UserSessionListView,
+    UserSessionRevokeView,
+    UserSessionRevokeAllView,
 )
 
 
@@ -157,5 +160,24 @@ path(
     "me/mfa/status/",
     MFAStatusView.as_view(),
     name="mfa-status",
+),
+
+path(
+    "me/sessions/",
+    UserSessionListView.as_view(),
+    name="user-session-list",
+),
+
+
+path(
+    "me/sessions/<uuid:session_id>/",
+    UserSessionRevokeView.as_view(),
+    name="user-session-revoke",
+),
+
+path(
+    "me/sessions/revoke-all/",
+    UserSessionRevokeAllView.as_view(),
+    name="user-session-revoke-all",
 ),
 ]

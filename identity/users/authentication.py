@@ -4,12 +4,9 @@ from django.db import transaction
 from rest_framework.exceptions import Throttled
 from rest_framework import serializers
 
-from rest_framework_simplejwt.serializers import (
-    TokenObtainPairSerializer,
-)
-
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
+    TokenRefreshView,
 )
 
 from .mfa import verify_totp_code_with_counter
@@ -21,9 +18,35 @@ from .mfa_recovery import (
 from .models import (
     User,
     AuditLog,
+    UserSession,
 )
 
 from .rate_limit import check_rate_limit
+from .session_management import create_user_session
+from rest_framework_simplejwt.tokens import (
+    RefreshToken,
+    AccessToken,
+)
+
+from .session_management import (
+    attach_session_to_token_data,
+)
+from rest_framework_simplejwt.serializers import (
+    TokenRefreshSerializer,
+    TokenObtainPairSerializer,
+)
+
+from rest_framework_simplejwt.exceptions import (
+    InvalidToken,
+)
+
+from datetime import datetime, timezone as dt_timezone
+from django.utils import timezone
+
+from rest_framework.exceptions import AuthenticationFailed
+from rest_framework_simplejwt.authentication import (
+    JWTAuthentication,
+)
 
 
 # ============================================================
@@ -237,6 +260,49 @@ def apply_recovery_rate_limit(
         raise	
 
 
+
+class SessionJWTAuthentication(
+    JWTAuthentication
+):
+
+    def get_user(self, validated_token):
+
+        user = super().get_user(
+            validated_token
+        )
+
+        session_id = validated_token.get(
+            "session_id"
+        )
+
+        # Compatibilidade temporária com tokens
+        # antigos e tokens criados diretamente
+        # nos testes com RefreshToken.for_user().
+        if not session_id:
+            return user
+
+        try:
+            session = UserSession.objects.get(
+                id=session_id,
+                user=user,
+            )
+        except UserSession.DoesNotExist:
+            raise AuthenticationFailed(
+                "Session does not exist."
+            )
+
+        if session.revoked_at is not None:
+            raise AuthenticationFailed(
+                "Session has been revoked."
+            )
+
+        if session.expires_at <= timezone.now():
+            raise AuthenticationFailed(
+                "Session has expired."
+            )
+
+        return user
+
 # ============================================================
 # MFA / TOTP LOGIN
 # ============================================================
@@ -294,12 +360,17 @@ class MFATokenObtainPairSerializer(
             raise
 
         # ------------------------------------------------------
+        # ------------------------------------------------------
         # USER WITHOUT MFA
         # ------------------------------------------------------
 
         if not self.user.mfa_enabled:
 
-            return data
+            return attach_session_to_token_data(
+                user=self.user,
+                request=request,
+                data=data,
+            )
 
         code = attrs.get(
             "code"
@@ -393,7 +464,11 @@ class MFATokenObtainPairSerializer(
                 ]
             )
 
-        return data
+        return attach_session_to_token_data(
+            user=self.user,
+            request=request,
+            data=data,
+        )
 
 
 class MFATokenObtainPairView(
@@ -467,7 +542,15 @@ class NormalTokenObtainPairSerializer(
                 }
             )
 
-        return data
+        refresh = RefreshToken(
+            data["refresh"]
+        )
+
+        return attach_session_to_token_data(
+            user=self.user,
+            request=request,
+            data=data,
+        )
 
 
 class NormalTokenObtainPairView(
@@ -626,7 +709,11 @@ class MFARecoveryTokenObtainPairSerializer(
             status_code=200,
         )
 
-        return data
+        return attach_session_to_token_data(
+            user=self.user,
+            request=request,
+            data=data,
+        )
 
 
 class MFARecoveryTokenObtainPairView(
@@ -635,4 +722,99 @@ class MFARecoveryTokenObtainPairView(
 
     serializer_class = (
         MFARecoveryTokenObtainPairSerializer
+    )
+
+
+class SessionTokenRefreshSerializer(
+    TokenRefreshSerializer
+):
+
+    def validate(self, attrs):
+
+        old_refresh = RefreshToken(
+            attrs["refresh"]
+        )
+
+        session_id = old_refresh.get(
+            "session_id"
+        )
+
+        data = super().validate(attrs)
+
+        # Compatibilidade temporária com tokens antigos
+        # que ainda não possuem session_id.
+        if not session_id:
+            return data
+
+        try:
+            session = UserSession.objects.get(
+                id=session_id
+            )
+        except UserSession.DoesNotExist:
+            raise InvalidToken(
+                "Session does not exist."
+            )
+
+        if session.revoked_at is not None:
+            raise InvalidToken(
+                "Session has been revoked."
+            )
+
+        new_refresh = data.get("refresh")
+
+        if new_refresh:
+
+            refresh = RefreshToken(
+                new_refresh
+            )
+
+            refresh["session_id"] = str(
+                session.id
+            )
+
+            access = refresh.access_token
+
+            data["refresh"] = str(refresh)
+            data["access"] = str(access)
+
+            session.jti = str(
+                refresh["jti"]
+            )
+
+            session.expires_at = (
+                datetime.fromtimestamp(
+                    int(refresh["exp"]),
+                    tz=dt_timezone.utc,
+                )
+            )
+
+            session.save(
+                update_fields=[
+                    "jti",
+                    "expires_at",
+                    "last_activity",
+                ]
+            )
+
+        else:
+            # Caso a configuração futura deixe
+            # de rotacionar refresh tokens.
+            access = AccessToken(
+                data["access"]
+            )
+
+            access["session_id"] = str(
+                session.id
+            )
+
+            data["access"] = str(access)
+
+        return data
+
+class SessionTokenRefreshView(
+    TokenRefreshView
+):
+
+    serializer_class = (
+        SessionTokenRefreshSerializer
     )

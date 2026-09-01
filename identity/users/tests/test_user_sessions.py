@@ -1,0 +1,1620 @@
+from rest_framework.test import APITestCase
+from users.models import User, UserSession
+import pyotp
+
+from django.core.cache import cache
+from users.mfa import generate_secret
+from users.mfa_recovery import generate_recovery_codes
+
+from datetime import timedelta
+from django.utils import timezone
+
+from rest_framework_simplejwt.tokens import (
+    AccessToken,
+    RefreshToken,
+)
+
+from rest_framework_simplejwt.token_blacklist.models import (
+    BlacklistedToken,
+    OutstandingToken,
+)
+
+class UserSessionAuthenticationTest(APITestCase):
+
+    def setUp(self):
+
+        self.password = "StrongPassword123!"
+
+        self.user = User.objects.create_user(
+            username="session-user",
+            password=self.password,
+        )
+
+        self.normal_login_url = "/api/token/"
+
+    def test_normal_login_creates_user_session(self):
+
+        response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.assertEqual(
+            UserSession.objects.filter(
+                user=self.user
+            ).count(),
+            1,
+        )
+
+    def test_failed_login_does_not_create_session(self):
+
+        response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": "WrongPassword123!",
+            },
+            format="json",
+        )
+
+        self.assertNotEqual(
+            response.status_code,
+            200,
+        )
+
+        self.assertFalse(
+            UserSession.objects.filter(
+                user=self.user
+            ).exists()
+        )
+    def test_session_jti_matches_refresh_token(self):
+
+        response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        refresh_token = RefreshToken(
+            response.data["refresh"]
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertEqual(
+            session.jti,
+            str(refresh_token["jti"]),
+        )
+    def test_session_stores_request_metadata(self):
+
+        response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            HTTP_USER_AGENT="Firefox Test Browser",
+            REMOTE_ADDR="192.168.1.50",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertEqual(
+            session.ip_address,
+            "192.168.1.50",
+        )
+
+        self.assertEqual(
+            session.user_agent,
+            "Firefox Test Browser",
+        )
+
+        self.assertEqual(
+            session.device_name,
+            "Firefox Test Browser",
+        )
+
+    def test_sessions_endpoint_requires_authentication(self):
+
+        response = self.client.get(
+            "/api/users/me/sessions/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401,
+        )
+    def test_user_can_list_own_sessions(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        access = login_response.data["access"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.assertEqual(
+            len(response.data),
+            1,
+        )
+
+        self.assertEqual(
+            response.data[0]["device_name"],
+            UserSession.objects.get(
+                user=self.user
+            ).device_name,
+        )
+
+    def test_sessions_endpoint_does_not_expose_sensitive_data(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        access = login_response.data["access"]
+        refresh = login_response.data["refresh"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        response_text = str(response.data)
+
+        self.assertNotIn(
+            "jti",
+            response.data[0],
+        )
+
+        self.assertNotIn(
+            refresh,
+            response_text,
+        )
+
+        self.assertNotIn(
+            access,
+            response_text,
+        )
+
+    def test_user_cannot_see_other_users_sessions(self):
+
+        other_user = User.objects.create_user(
+            username="other-session-user",
+            password="OtherPassword123!",
+        )
+
+        UserSession.objects.create(
+            user=other_user,
+            jti="other-user-jti",
+            device_name="Other Device",
+            user_agent="Other Browser",
+            ip_address="10.0.0.10",
+            expires_at=timezone.now()
+            + timedelta(days=1),
+        )
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {login_response.data['access']}"
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        returned_ids = {
+            item["id"]
+            for item in response.data
+        }
+
+        other_session = UserSession.objects.get(
+            user=other_user
+        )
+
+        self.assertNotIn(
+            str(other_session.id),
+            returned_ids,
+        )
+
+    def test_login_tokens_contain_session_id(self):
+
+        response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        refresh = RefreshToken(
+            response.data["refresh"]
+        )
+
+        access = AccessToken(
+            response.data["access"]
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertEqual(
+            refresh["session_id"],
+            str(session.id),
+        )
+
+        self.assertEqual(
+            access["session_id"],
+            str(session.id),
+        )
+
+    def test_session_jti_still_matches_modified_refresh(self):
+
+        response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        refresh = RefreshToken(
+            response.data["refresh"]
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertEqual(
+            session.jti,
+            str(refresh["jti"]),
+        )
+
+    def test_refresh_preserves_session_id(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+            login_response.data,
+        )
+
+        old_refresh = RefreshToken(
+            login_response.data["refresh"]
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        old_session_id = old_refresh["session_id"]
+
+        refresh_response = self.client.post(
+            "/api/token/refresh/",
+            {
+                "refresh": str(old_refresh),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            refresh_response.status_code,
+            200,
+            refresh_response.data,
+        )
+
+        new_refresh = RefreshToken(
+            refresh_response.data["refresh"]
+        )
+
+        new_access = AccessToken(
+            refresh_response.data["access"]
+        )
+
+        self.assertEqual(
+            new_refresh["session_id"],
+            old_session_id,
+        )
+
+        self.assertEqual(
+            new_access["session_id"],
+            old_session_id,
+        )
+
+        self.assertEqual(
+            str(session.id),
+            old_session_id,
+        )
+
+    def test_refresh_updates_session_jti(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+            login_response.data,
+        )
+
+        old_refresh = RefreshToken(
+            login_response.data["refresh"]
+        )
+
+        old_jti = str(
+            old_refresh["jti"]
+        )
+
+        refresh_response = self.client.post(
+            "/api/token/refresh/",
+            {
+                "refresh": str(old_refresh),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            refresh_response.status_code,
+            200,
+            refresh_response.data,
+        )
+
+        new_refresh = RefreshToken(
+            refresh_response.data["refresh"]
+        )
+
+        new_jti = str(
+            new_refresh["jti"]
+        )
+
+        self.assertNotEqual(
+            old_jti,
+            new_jti,
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertEqual(
+            session.jti,
+            new_jti,
+        )
+
+    def test_refresh_does_not_create_new_user_session(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+        )
+
+        self.assertEqual(
+            UserSession.objects.filter(
+                user=self.user
+            ).count(),
+            1,
+        )
+
+        refresh_response = self.client.post(
+            "/api/token/refresh/",
+            {
+                "refresh": login_response.data[
+                    "refresh"
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            refresh_response.status_code,
+            200,
+            refresh_response.data,
+        )
+
+        self.assertEqual(
+            UserSession.objects.filter(
+                user=self.user
+            ).count(),
+            1,
+        )
+
+    def test_revoked_session_cannot_refresh_token(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        session.revoked_at = timezone.now()
+
+        session.save(
+            update_fields=[
+                "revoked_at",
+            ]
+        )
+
+        response = self.client.post(
+            "/api/token/refresh/",
+            {
+                "refresh": login_response.data[
+                    "refresh"
+                ],
+            },
+            format="json",
+        )
+
+        self.assertNotEqual(
+            response.status_code,
+            200,
+        )
+
+
+    def test_session_access_token_can_access_protected_endpoint(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+            login_response.data,
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer "
+                f"{login_response.data['access']}"
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+    def test_revoked_session_cannot_use_access_token(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+            login_response.data,
+        )
+
+        access = login_response.data["access"]
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        session.revoked_at = timezone.now()
+
+        session.save(
+            update_fields=[
+                "revoked_at",
+            ]
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401,
+        )
+
+
+    def test_deleted_session_invalidates_access_token(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+        )
+
+        access = login_response.data["access"]
+
+        UserSession.objects.filter(
+            user=self.user
+        ).delete()
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401,
+        )
+
+    def test_legacy_token_without_session_id_remains_valid(self):
+
+        refresh = RefreshToken.for_user(
+            self.user
+        )
+
+        access = refresh.access_token
+
+        self.assertNotIn(
+            "session_id",
+            access,
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {str(access)}"
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+
+    def test_user_can_revoke_own_session(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            200,
+        )
+
+        access = login_response.data["access"]
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        response = self.client.delete(
+            f"/api/users/me/sessions/{session.id}/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        session.refresh_from_db()
+
+        self.assertIsNotNone(
+            session.revoked_at
+        )
+
+
+    def test_revoked_session_access_token_is_rejected(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        access = login_response.data["access"]
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        revoke_response = self.client.delete(
+            f"/api/users/me/sessions/{session.id}/"
+        )
+
+        self.assertEqual(
+            revoke_response.status_code,
+            200,
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401,
+        )
+
+    def test_user_cannot_revoke_other_users_session(self):
+
+        other_user = User.objects.create_user(
+            username="other-revoke-user",
+            password="OtherPassword123!",
+        )
+
+        other_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": other_user.username,
+                "password": "OtherPassword123!",
+            },
+            format="json",
+        )
+
+        other_session = UserSession.objects.get(
+            user=other_user
+        )
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {login_response.data['access']}"
+            )
+        )
+
+        response = self.client.delete(
+            f"/api/users/me/sessions/{other_session.id}/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            404,
+        )
+
+        other_session.refresh_from_db()
+
+        self.assertIsNone(
+            other_session.revoked_at
+        )
+
+    def test_revoke_all_keeps_current_session(self):
+
+        first_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            first_login.status_code,
+            200,
+        )
+
+        current_access = first_login.data[
+            "access"
+        ]
+
+        current_session_id = AccessToken(
+            current_access
+        )["session_id"]
+
+        second_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            second_login.status_code,
+            200,
+        )
+
+        self.assertEqual(
+            UserSession.objects.filter(
+                user=self.user
+            ).count(),
+            2,
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {current_access}"
+            )
+        )
+
+        response = self.client.post(
+            "/api/users/me/sessions/revoke-all/",
+            {
+                "keep_current": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        current_session = UserSession.objects.get(
+            id=current_session_id
+        )
+
+        self.assertIsNone(
+            current_session.revoked_at
+        )
+
+        other_session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .exclude(id=current_session_id)
+            .get()
+        )
+
+        self.assertIsNotNone(
+            other_session.revoked_at
+        )
+
+    def test_current_session_still_works_after_revoke_all_others(
+        self
+    ):
+
+        first_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        current_access = first_login.data[
+            "access"
+        ]
+
+        self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {current_access}"
+            )
+        )
+
+        revoke_response = self.client.post(
+            "/api/users/me/sessions/revoke-all/",
+            {
+                "keep_current": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            revoke_response.status_code,
+            200,
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+    def test_other_session_is_rejected_after_revoke_all(
+        self
+    ):
+
+        first_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        current_access = first_login.data[
+            "access"
+        ]
+
+        second_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        other_access = second_login.data[
+            "access"
+        ]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {current_access}"
+            )
+        )
+
+        revoke_response = self.client.post(
+            "/api/users/me/sessions/revoke-all/",
+            {
+                "keep_current": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            revoke_response.status_code,
+            200,
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {other_access}"
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401,
+        )
+
+    def test_revoke_all_can_revoke_current_session(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        access = login_response.data[
+            "access"
+        ]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        response = self.client.post(
+            "/api/users/me/sessions/revoke-all/",
+            {
+                "keep_current": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertIsNotNone(
+            session.revoked_at
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401,
+        )
+
+
+    def test_revoke_session_blacklists_refresh_token(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        refresh = RefreshToken(
+            login_response.data["refresh"]
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {login_response.data['access']}"
+            )
+        )
+
+        response = self.client.delete(
+            f"/api/users/me/sessions/{session.id}/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        outstanding = OutstandingToken.objects.get(
+            jti=str(refresh["jti"])
+        )
+
+        self.assertTrue(
+            BlacklistedToken.objects.filter(
+                token=outstanding
+            ).exists()
+        )
+
+    def test_blacklisted_session_refresh_cannot_be_used(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        refresh = login_response.data[
+            "refresh"
+        ]
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {login_response.data['access']}"
+            )
+        )
+
+        revoke_response = self.client.delete(
+            f"/api/users/me/sessions/{session.id}/"
+        )
+
+        self.assertEqual(
+            revoke_response.status_code,
+            200,
+        )
+
+        self.client.credentials()
+
+        refresh_response = self.client.post(
+            "/api/token/refresh/",
+            {
+                "refresh": refresh,
+            },
+            format="json",
+        )
+
+        self.assertNotEqual(
+            refresh_response.status_code,
+            200,
+        )
+    
+    def test_revoke_all_blacklists_other_session_refresh(self):
+
+        first_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        second_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        second_refresh = RefreshToken(
+            second_login.data["refresh"]
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {first_login.data['access']}"
+            )
+        )
+
+        response = self.client.post(
+            "/api/users/me/sessions/revoke-all/",
+            {
+                "keep_current": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        outstanding = OutstandingToken.objects.get(
+            jti=str(second_refresh["jti"])
+        )
+
+        self.assertTrue(
+            BlacklistedToken.objects.filter(
+                token=outstanding
+            ).exists()
+        )
+
+    def test_logout_revokes_user_session(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        access = login_response.data["access"]
+        refresh = login_response.data["refresh"]
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        response = self.client.post(
+            "/api/users/logout/",
+            {
+                "refresh": refresh,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        session.refresh_from_db()
+
+        self.assertIsNotNone(
+            session.revoked_at
+        )
+
+    def test_logout_invalidates_access_token_session(self):
+
+        login_response = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        access = login_response.data["access"]
+        refresh = login_response.data["refresh"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        logout_response = self.client.post(
+            "/api/users/logout/",
+            {
+                "refresh": refresh,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            logout_response.status_code,
+            200,
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            401,
+        )
+
+    def test_logout_does_not_revoke_other_session(self):
+
+        first_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        second_login = self.client.post(
+            self.normal_login_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        first_access = first_login.data["access"]
+        first_refresh = first_login.data["refresh"]
+
+        second_access = second_login.data["access"]
+
+        first_session_id = AccessToken(
+            first_access
+        )["session_id"]
+
+        second_session_id = AccessToken(
+            second_access
+        )["session_id"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {first_access}"
+            )
+        )
+
+        response = self.client.post(
+            "/api/users/logout/",
+            {
+                "refresh": first_refresh,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+        first_session = UserSession.objects.get(
+            id=first_session_id
+        )
+
+        second_session = UserSession.objects.get(
+            id=second_session_id
+        )
+
+        self.assertIsNotNone(
+            first_session.revoked_at
+        )
+
+        self.assertIsNone(
+            second_session.revoked_at
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {second_access}"
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+        )
+
+class UserSessionMFAAuthenticationTest(APITestCase):
+
+    def setUp(self):
+
+        cache.clear()
+
+        self.password = "TestPassword123!"
+
+        self.user = User.objects.create_user(
+            username="session-mfa-user",
+            email="session-mfa@example.com",
+            password=self.password,
+        )
+
+        self.mfa_token_url = "/api/token/mfa/"
+        self.recovery_token_url = (
+            "/api/token/mfa/recovery/"
+        )
+
+    def tearDown(self):
+
+        cache.clear()
+
+    def enable_mfa(self):
+
+        self.user.mfa_secret = generate_secret()
+        self.user.mfa_enabled = True
+        self.user.mfa_last_used_counter = None
+
+        self.user.save(
+            update_fields=[
+                "mfa_secret",
+                "mfa_enabled",
+                "mfa_last_used_counter",
+            ]
+        )
+
+    def current_totp_code(self):
+
+        self.user.refresh_from_db()
+
+        return pyotp.TOTP(
+            self.user.mfa_secret
+        ).now()
+
+    def test_mfa_login_creates_user_session(self):
+
+        self.enable_mfa()
+
+        response = self.client.post(
+            self.mfa_token_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+                "code": self.current_totp_code(),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.assertEqual(
+            UserSession.objects.filter(
+                user=self.user
+            ).count(),
+            1,
+        )
+
+        refresh = RefreshToken(
+            response.data["refresh"]
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertEqual(
+            session.jti,
+            str(refresh["jti"]),
+        )
+
+    def test_invalid_mfa_login_does_not_create_session(self):
+
+        self.enable_mfa()
+
+        response = self.client.post(
+            self.mfa_token_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+                "code": "000000",
+            },
+            format="json",
+        )
+
+        self.assertNotEqual(
+            response.status_code,
+            200,
+        )
+
+        self.assertFalse(
+            UserSession.objects.filter(
+                user=self.user
+            ).exists()
+        )
+
+    def test_recovery_login_creates_user_session(self):
+
+        self.enable_mfa()
+
+        codes = generate_recovery_codes(
+            self.user,
+            count=10,
+        )
+
+        response = self.client.post(
+            self.recovery_token_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+                "recovery_code": codes[0],
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            200,
+            response.data,
+        )
+
+        self.assertEqual(
+            UserSession.objects.filter(
+                user=self.user
+            ).count(),
+            1,
+        )
+
+        refresh = RefreshToken(
+            response.data["refresh"]
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertEqual(
+            session.jti,
+            str(refresh["jti"]),
+        )
+
+    def test_invalid_recovery_login_does_not_create_session(self):
+
+        self.enable_mfa()
+
+        generate_recovery_codes(
+            self.user,
+            count=10,
+        )
+
+        response = self.client.post(
+            self.recovery_token_url,
+            {
+                "username": self.user.username,
+                "password": self.password,
+                "recovery_code": "AAAA-BBBB-CCCC",
+            },
+            format="json",
+        )
+
+        self.assertNotEqual(
+            response.status_code,
+            200,
+        )
+
+        self.assertFalse(
+            UserSession.objects.filter(
+                user=self.user
+            ).exists()
+        )
+
+    

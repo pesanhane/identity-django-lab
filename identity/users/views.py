@@ -1,17 +1,9 @@
 
-from .mfa_recovery import generate_recovery_codes
-
 from django.db import transaction
 from django.utils import timezone
 
 from .rbac import DynamicPermission
-
-
-
-
 from rest_framework.exceptions import Throttled
-
-
 from .authentication import apply_mfa_rate_limit
 
 from .models import (
@@ -42,6 +34,9 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated
 from rest_framework_simplejwt.tokens import RefreshToken
+from .models import UserSession
+from rest_framework.exceptions import NotFound
+from rest_framework_simplejwt.exceptions import TokenError
 
 from .utils import (
     create_audit_log,
@@ -54,6 +49,14 @@ from .mfa import (
     generate_totp_uri,
     verify_totp_code_with_counter,
 )
+
+from .mfa_recovery import generate_recovery_codes
+
+from .session_management import (
+    blacklist_user_session,
+)
+
+from rest_framework_simplejwt.exceptions import TokenError
 
 
 # ============================================================
@@ -872,33 +875,119 @@ class LogoutView(APIView):
 
     def post(self, request):
 
-        serializer = LogoutSerializer(
-            data=request.data
+        refresh_token = request.data.get(
+            "refresh"
         )
 
-        serializer.is_valid(
-            raise_exception=True
-        )
+        if not refresh_token:
+            return Response(
+                {
+                    "detail": (
+                        "Refresh token is required."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        refresh_token = serializer.validated_data["refresh"]
+        try:
 
-        # Auditoria antes da invalidação do token
-        create_audit_log(
-            request,
-            "LOGOUT",
-            f"Logout de {request.user.username}"
-        )
+            token = RefreshToken(
+                refresh_token
+            )
 
-        # Invalidar refresh token
-        token = RefreshToken(refresh_token)
-        token.blacklist()
+            session_id = token.get(
+                "session_id"
+            )
 
-        return Response(
-            {
-                "message": "Logout successful."
-            },
-            status=status.HTTP_200_OK
-        )
+            # Garante que o refresh token pertence
+            # ao utilizador autenticado.
+            token_user_id = token.get(
+                "user_id"
+            )
+
+            if str(token_user_id) != str(
+                request.user.id
+            ):
+                return Response(
+                    {
+                        "detail": (
+                            "Refresh token does not "
+                            "belong to the authenticated user."
+                        )
+                    },
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            # Revoga o refresh token no
+            # mecanismo nativo do SimpleJWT.
+            token.blacklist()
+
+            # Tokens antigos podem não possuir
+            # session_id.
+            if session_id:
+
+                UserSession.objects.filter(
+                    id=session_id,
+                    user=request.user,
+                    revoked_at__isnull=True,
+                ).update(
+                    revoked_at=timezone.now()
+                )
+
+            # Auditoria do logout
+            # Auditoria apenas quando o utilizador
+            # pertence a uma organização.
+            if getattr(
+                request.user,
+                "organization",
+                None,
+            ) is not None:
+
+                create_audit_log(
+                    request,
+                    "LOGOUT",
+                    (
+                        f"Utilizador "
+                        f"{request.user.username} "
+                        f"terminou a sessão."
+                    ),
+                    status_code=200,
+                    result="SUCCESS",
+                )
+
+            return Response(
+                {
+                    "message": "Logout successful.",
+                    "detail": "Logout successful.",
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        except TokenError:
+
+            return Response(
+                {
+                    "detail": (
+                        "Invalid, expired or "
+                        "blacklisted refresh token."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        except (
+            ValueError,
+            TypeError,
+        ):
+
+            return Response(
+                {
+                    "detail": (
+                        "Invalid refresh token."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
 # ============================================================
 # AUDITORIA
@@ -1874,6 +1963,144 @@ class MFARecoveryCodesView(APIView):
                     "Recovery codes generated successfully."
                 ),
                 "recovery_codes": codes,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+class UserSessionListView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+
+        sessions = (
+            UserSession.objects
+            .filter(user=request.user)
+            .order_by("-last_activity")
+        )
+
+        data = []
+
+        for session in sessions:
+
+            data.append(
+                {
+                    "id": str(session.id),
+                    "device_name": session.device_name,
+                    "ip_address": session.ip_address,
+                    "created_at": session.created_at,
+                    "last_activity": session.last_activity,
+                    "expires_at": session.expires_at,
+                    "revoked": session.is_revoked,
+                }
+            )
+
+        return Response(
+            data,
+            status=status.HTTP_200_OK,
+        )
+
+
+
+class UserSessionRevokeView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, session_id):
+
+        try:
+            session = UserSession.objects.get(
+                id=session_id,
+                user=request.user,
+            )
+
+        except UserSession.DoesNotExist:
+            raise NotFound(
+                "Session not found."
+            )
+
+        if session.revoked_at is None:
+
+            blacklist_user_session(
+                session
+            )
+
+            session.revoked_at = timezone.now()
+
+            session.save(
+                update_fields=[
+                    "revoked_at",
+                ]
+            )
+
+        return Response(
+            {
+                "detail": (
+                    "Session revoked successfully."
+                )
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class UserSessionRevokeAllView(APIView):
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+
+        keep_current = request.data.get(
+            "keep_current",
+            True,
+        )
+
+        session_id = request.auth.get(
+            "session_id"
+        )
+
+        sessions = UserSession.objects.filter(
+            user=request.user,
+            revoked_at__isnull=True,
+        )
+
+        if (
+            keep_current
+            and session_id
+        ):
+            sessions = sessions.exclude(
+                id=session_id
+            )
+
+        now = timezone.now()
+
+        revoked_count = 0
+
+        for session in sessions:
+
+            blacklist_user_session(
+                session
+            )
+
+            session.revoked_at = now
+
+            session.save(
+                update_fields=[
+                    "revoked_at",
+                ]
+            )
+
+            revoked_count += 1
+
+        return Response(
+            {
+                "detail": (
+                    "Sessions revoked successfully."
+                ),
+                "revoked_count": revoked_count,
+                "kept_current": bool(
+                    keep_current
+                    and session_id
+                ),
             },
             status=status.HTTP_200_OK,
         )
