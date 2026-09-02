@@ -1,5 +1,8 @@
 
 import re
+import ipaddress
+
+from django.conf import settings
 from datetime import datetime, timezone as dt_timezone
 
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -17,23 +20,87 @@ from .models import (
 )
 
 def get_client_ip(request):
-    """
-    Obtém o IP do cliente.
 
-    Não confiar cegamente em X-Forwarded-For em produção
-    sem configuração correta de trusted proxies.
-    """
+    remote_addr = request.META.get(
+        "REMOTE_ADDR"
+    )
 
-    x_forwarded_for = request.META.get(
+    if not remote_addr:
+        return None
+
+    # ============================================================
+    # VALIDATE DIRECT CONNECTION ADDRESS
+    # ============================================================
+
+    try:
+
+        remote_ip = ipaddress.ip_address(
+            remote_addr
+        )
+
+    except ValueError:
+
+        return None
+
+    # ============================================================
+    # UNTRUSTED DIRECT CLIENT
+    # ============================================================
+    #
+    # X-Forwarded-For só é considerado quando
+    # REMOTE_ADDR pertence a um proxy/rede confiável.
+    # ============================================================
+
+    if not is_trusted_proxy(
+        remote_ip
+    ):
+
+        return str(remote_ip)
+
+    # ============================================================
+    # TRUSTED PROXY
+    # ============================================================
+
+    forwarded_for = request.META.get(
         "HTTP_X_FORWARDED_FOR"
     )
 
-    if x_forwarded_for:
-        return x_forwarded_for.split(",")[0].strip()
+    if not forwarded_for:
 
-    return request.META.get("REMOTE_ADDR")
+        return str(remote_ip)
 
+    forwarded_ips = [
+        value.strip()
+        for value in forwarded_for.split(",")
+        if value.strip()
+    ]
 
+    if not forwarded_ips:
+
+        return str(remote_ip)
+
+    # ============================================================
+    # ORIGINAL CLIENT ADDRESS
+    # ============================================================
+
+    client_ip = forwarded_ips[0]
+
+    try:
+
+        validated_client_ip = (
+            ipaddress.ip_address(
+                client_ip
+            )
+        )
+
+    except ValueError:
+
+        # Header inválido:
+        # voltamos ao REMOTE_ADDR confiável.
+        return str(remote_ip)
+
+    return str(
+        validated_client_ip
+    )
 def get_device_name(request):
 
     user_agent = request.META.get(
@@ -470,3 +537,32 @@ def get_operating_system(user_agent):
         return "Linux"
 
     return "Unknown OS"
+
+
+def is_trusted_proxy(
+    remote_ip,
+):
+
+    trusted_proxies = getattr(
+        settings,
+        "TRUSTED_PROXY_IPS",
+        [],
+    )
+
+    for proxy in trusted_proxies:
+
+        try:
+
+            network = ipaddress.ip_network(
+                proxy,
+                strict=False,
+            )
+
+        except ValueError:
+
+            continue
+
+        if remote_ip in network:
+            return True
+
+    return False

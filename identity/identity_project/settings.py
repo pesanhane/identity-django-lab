@@ -8,6 +8,16 @@ BASE_DIR = os.path.dirname(
 )
 
 
+TRUSTED_PROXY_IPS = [
+    ip.strip()
+    for ip in os.getenv(
+        "TRUSTED_PROXY_IPS",
+        ""
+    ).split(",")
+    if ip.strip()
+]
+
+
 
 
 

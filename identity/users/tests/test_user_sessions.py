@@ -1,5 +1,5 @@
 from rest_framework.test import APITestCase
-
+from django.test import override_settings
 
 from rest_framework import status
 
@@ -160,6 +160,40 @@ class UserSessionAuthenticationTest(APITestCase):
         self.assertEqual(
             session.ip_address,
             "192.168.1.100",
+        )
+
+    @override_settings(
+        TRUSTED_PROXY_IPS=[]
+    )
+    def test_untrusted_client_cannot_spoof_forwarded_ip(
+        self
+    ):
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="203.0.113.10",
+            HTTP_X_FORWARDED_FOR="1.2.3.4",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        self.assertEqual(
+            session.ip_address,
+            "203.0.113.10",
         )
 
     def test_sessions_endpoint_requires_authentication(self):
@@ -1754,6 +1788,155 @@ class UserSessionAuthenticationTest(APITestCase):
         self.assertEqual(
             session.last_activity,
             original_activity,
+        )
+
+    @override_settings(
+        TRUSTED_PROXY_IPS=[
+            "172.18.0.5"
+        ]
+    )
+    def test_trusted_proxy_uses_forwarded_client_ip(
+        self
+    ):
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="172.18.0.5",
+            HTTP_X_FORWARDED_FOR="41.77.100.20",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        self.assertEqual(
+            session.ip_address,
+            "41.77.100.20",
+        )
+
+
+    @override_settings(
+        TRUSTED_PROXY_IPS=[
+            "172.18.0.0/16"
+        ]
+    )
+    def test_trusted_proxy_network_is_supported(
+        self
+    ):
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="172.18.5.20",
+            HTTP_X_FORWARDED_FOR="41.77.100.25",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        self.assertEqual(
+            session.ip_address,
+            "41.77.100.25",
+        )
+
+    @override_settings(
+        TRUSTED_PROXY_IPS=[
+            "172.18.0.0/16"
+        ]
+    )
+    def test_invalid_forwarded_ip_falls_back_to_proxy_ip(
+        self
+    ):
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="172.18.0.5",
+            HTTP_X_FORWARDED_FOR="invalid-ip",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        self.assertEqual(
+            session.ip_address,
+            "172.18.0.5",
+        )
+
+
+    @override_settings(
+        TRUSTED_PROXY_IPS=[
+            "172.18.0.0/16"
+        ]
+    )
+    def test_trusted_proxy_reads_first_forwarded_address(
+        self
+    ):
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="172.18.0.5",
+            HTTP_X_FORWARDED_FOR=(
+                "41.77.100.30, "
+                "172.18.0.10"
+            ),
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        self.assertEqual(
+            session.ip_address,
+            "41.77.100.30",
         )
 class UserSessionMFAAuthenticationTest(APITestCase):
 
