@@ -25,6 +25,9 @@ from .views import (
     UserSessionRevokeAllView,
 )
 
+from .session_step_up import (
+    SessionStepUpMFAView,
+)
 
 urlpatterns = [
 
@@ -179,5 +182,11 @@ path(
     "me/sessions/revoke-all/",
     UserSessionRevokeAllView.as_view(),
     name="user-session-revoke-all",
+),
+
+path(
+    "me/session/step-up/",
+    SessionStepUpMFAView.as_view(),
+    name="session-step-up-mfa",
 ),
 ]

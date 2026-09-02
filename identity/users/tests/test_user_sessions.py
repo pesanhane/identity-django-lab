@@ -1,3 +1,4 @@
+import pyotp
 from rest_framework.test import APITestCase
 from django.test import override_settings
 
@@ -2096,9 +2097,8 @@ class UserSessionAuthenticationTest(APITestCase):
             audit.description,
         )
 
-    def test_ip_and_device_change_generate_high_risk(
-        self
-    ):
+    def test_high_risk_without_mfa_requires_reauthentication(self):
+    
         self.assign_risk_test_organization()
         login_user_agent = (
             "Mozilla/5.0 "
@@ -2139,7 +2139,7 @@ class UserSessionAuthenticationTest(APITestCase):
 
         self.assertEqual(
             response.status_code,
-            status.HTTP_200_OK,
+            status.HTTP_401_UNAUTHORIZED,
         )
 
         audit = AuditLog.objects.filter(
@@ -2166,6 +2166,847 @@ class UserSessionAuthenticationTest(APITestCase):
             "score=90",
             audit.description,
         )
+
+    def test_high_risk_with_mfa_requires_step_up(
+        self
+    ):
+        self.assign_risk_test_organization()
+
+        login_user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        suspicious_user_agent = (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+
+        # --------------------------------------------------------
+        # 1. Criar a sessão no ambiente original
+        # --------------------------------------------------------
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=login_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        access = response.data["access"]
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        # --------------------------------------------------------
+        # 2. Ativar MFA antes da mudança de ambiente
+        # --------------------------------------------------------
+
+        self.user.mfa_enabled = True
+
+        self.user.mfa_secret = (
+            pyotp.random_base32()
+        )
+
+        self.user.save(
+            update_fields=[
+                "mfa_enabled",
+                "mfa_secret",
+            ]
+        )
+
+        # --------------------------------------------------------
+        # 3. Usar a mesma sessão noutro IP e dispositivo
+        # --------------------------------------------------------
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        # HIGH + MFA deve exigir step-up
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        # --------------------------------------------------------
+        # 4. Verificar estado persistente da sessão
+        # --------------------------------------------------------
+
+        session.refresh_from_db()
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        self.assertIsNotNone(
+            session.step_up_required_at
+        )
+
+        self.assertEqual(
+            session.risk_level,
+            "HIGH",
+        )
+
+        self.assertEqual(
+            session.risk_score,
+            90,
+        )
+
+        # --------------------------------------------------------
+        # 5. Verificar audit do HIGH risk
+        # --------------------------------------------------------
+
+        risk_audit = AuditLog.objects.filter(
+            user=self.user,
+            action="SESSION_RISK_DETECTED",
+        ).latest("created_at")
+
+        self.assertIn(
+            "IP_CHANGED",
+            risk_audit.description,
+        )
+
+        self.assertIn(
+            "DEVICE_CHANGED",
+            risk_audit.description,
+        )
+
+        self.assertIn(
+            "Risk level=HIGH",
+            risk_audit.description,
+        )
+
+        # --------------------------------------------------------
+        # 6. Verificar audit da resposta adaptativa
+        # --------------------------------------------------------
+
+        step_up_audit = AuditLog.objects.filter(
+            user=self.user,
+            action="SESSION_STEP_UP_REQUIRED",
+        ).latest("created_at")
+
+        self.assertIn(
+            "score=90",
+            step_up_audit.description,
+        )
+
+
+    def test_session_remains_blocked_until_step_up_completed(
+        self
+    ):
+        self.assign_risk_test_organization()
+
+        login_user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        suspicious_user_agent = (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=login_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        access = response.data["access"]
+
+        self.user.mfa_enabled = True
+        self.user.mfa_secret = pyotp.random_base32()
+
+        self.user.save(
+            update_fields=[
+                "mfa_enabled",
+                "mfa_secret",
+            ]
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        # --------------------------------------------------------
+        # Primeira anomalia HIGH
+        # --------------------------------------------------------
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        # --------------------------------------------------------
+        # Nova tentativa sem completar step-up
+        # --------------------------------------------------------
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        session.refresh_from_db()
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+    def test_invalid_totp_does_not_clear_step_up(
+        self
+    ):
+        self.assign_risk_test_organization()
+
+        login_user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        suspicious_user_agent = (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=login_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        access = response.data["access"]
+
+        self.user.mfa_enabled = True
+        self.user.mfa_secret = pyotp.random_base32()
+
+        self.user.save(
+            update_fields=[
+                "mfa_enabled",
+                "mfa_secret",
+            ]
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        # Gerar HIGH risk
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        # Tentar step-up com código inválido
+        response = self.client.post(
+            "/api/users/me/session/step-up/",
+            {
+                "code": "000000"
+            },
+            format="json",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        session.refresh_from_db()
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        self.assertEqual(
+            session.risk_level,
+            "HIGH",
+        )
+
+        self.assertEqual(
+            session.risk_score,
+            90,
+        )
+
+        audit = AuditLog.objects.filter(
+            user=self.user,
+            action="SESSION_STEP_UP_FAILED",
+        ).latest("created_at")
+
+        self.assertIn(
+            "TOTP code was invalid",
+            audit.description,
+        )
+
+    def test_valid_totp_completes_step_up_and_trusts_new_environment(
+        self
+    ):
+        self.assign_risk_test_organization()
+
+        login_user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        suspicious_user_agent = (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=login_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        access = response.data["access"]
+
+        secret = pyotp.random_base32()
+
+        self.user.mfa_enabled = True
+        self.user.mfa_secret = secret
+
+        self.user.save(
+            update_fields=[
+                "mfa_enabled",
+                "mfa_secret",
+            ]
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        # --------------------------------------------------------
+        # 1. Gerar HIGH risk
+        # --------------------------------------------------------
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        # --------------------------------------------------------
+        # 2. Gerar TOTP válido
+        # --------------------------------------------------------
+
+        code = pyotp.TOTP(
+            secret
+        ).now()
+
+        # --------------------------------------------------------
+        # 3. Completar step-up
+        # --------------------------------------------------------
+
+        response = self.client.post(
+            "/api/users/me/session/step-up/",
+            {
+                "code": code
+            },
+            format="json",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        # --------------------------------------------------------
+        # 4. Verificar sessão
+        # --------------------------------------------------------
+
+        session.refresh_from_db()
+
+        self.assertFalse(
+            session.requires_step_up
+        )
+
+        self.assertIsNotNone(
+            session.step_up_verified_at
+        )
+
+        self.assertEqual(
+            session.risk_level,
+            "NONE",
+        )
+
+        self.assertEqual(
+            session.risk_score,
+            0,
+        )
+
+        self.assertEqual(
+            str(session.ip_address),
+            "41.77.100.100",
+        )
+
+        self.assertIn(
+            "Chrome",
+            session.device_name,
+        )
+
+        self.assertIn(
+            "Windows",
+            session.device_name,
+        )
+
+        self.assertEqual(
+            session.user_agent,
+            suspicious_user_agent,
+        )
+
+        # --------------------------------------------------------
+        # 5. Verificar audit
+        # --------------------------------------------------------
+
+        audit = AuditLog.objects.filter(
+            user=self.user,
+            action="SESSION_STEP_UP_SUCCESS",
+        ).latest("created_at")
+
+        self.assertIn(
+            "successfully completed",
+            audit.description,
+        )
+
+        # --------------------------------------------------------
+        # 6. Nova request no ambiente agora confiável
+        # --------------------------------------------------------
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        session.refresh_from_db()
+
+        self.assertFalse(
+            session.requires_step_up
+        )
+
+    def test_step_up_rejects_reused_totp_code(
+        self
+    ):
+        self.assign_risk_test_organization()
+
+        login_user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        suspicious_user_agent = (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=login_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        access = response.data["access"]
+
+        secret = pyotp.random_base32()
+
+        self.user.mfa_enabled = True
+        self.user.mfa_secret = secret
+
+        self.user.save(
+            update_fields=[
+                "mfa_enabled",
+                "mfa_secret",
+            ]
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        # --------------------------------------------------------
+        # 1. Gerar HIGH risk
+        # --------------------------------------------------------
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        # --------------------------------------------------------
+        # 2. Gerar TOTP válido
+        # --------------------------------------------------------
+
+        code = pyotp.TOTP(
+            secret
+        ).now()
+
+        # --------------------------------------------------------
+        # 3. Primeiro step-up deve funcionar
+        # --------------------------------------------------------
+
+        response = self.client.post(
+            "/api/users/me/session/step-up/",
+            {
+                "code": code
+            },
+            format="json",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.user.refresh_from_db()
+
+        used_counter = (
+            self.user.mfa_last_used_counter
+        )
+
+        self.assertIsNotNone(
+            used_counter
+        )
+
+        # --------------------------------------------------------
+        # 4. Forçar novo step-up na mesma sessão
+        #    apenas para testar replay
+        # --------------------------------------------------------
+
+        session.refresh_from_db()
+
+        session.requires_step_up = True
+        session.risk_score = 90
+        session.risk_level = "HIGH"
+
+        session.save(
+            update_fields=[
+                "requires_step_up",
+                "risk_score",
+                "risk_level",
+            ]
+        )
+
+        # --------------------------------------------------------
+        # 5. Reutilizar exatamente o mesmo TOTP
+        # --------------------------------------------------------
+
+        response = self.client.post(
+            "/api/users/me/session/step-up/",
+            {
+                "code": code
+            },
+            format="json",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        # --------------------------------------------------------
+        # 6. Sessão continua bloqueada
+        # --------------------------------------------------------
+
+        session.refresh_from_db()
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        self.assertEqual(
+            session.risk_level,
+            "HIGH",
+        )
+
+        self.assertEqual(
+            session.risk_score,
+            90,
+        )
+
+        # --------------------------------------------------------
+        # 7. Contador não foi alterado
+        # --------------------------------------------------------
+
+        self.user.refresh_from_db()
+
+        self.assertEqual(
+            self.user.mfa_last_used_counter,
+            used_counter,
+        )
+
+        # --------------------------------------------------------
+        # 8. Audit de replay
+        # --------------------------------------------------------
+
+        audit = AuditLog.objects.filter(
+            user=self.user,
+            action="SESSION_STEP_UP_REPLAY_DETECTED",
+        ).latest("created_at")
+
+        self.assertIn(
+            "already used",
+            audit.description,
+        )
+
+    def test_step_up_requires_totp_code(
+        self
+    ):
+        self.assign_risk_test_organization()
+
+        login_user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        suspicious_user_agent = (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=login_user_agent,
+        )
+
+        access = response.data["access"]
+
+        self.user.mfa_enabled = True
+        self.user.mfa_secret = pyotp.random_base32()
+
+        self.user.save(
+            update_fields=[
+                "mfa_enabled",
+                "mfa_secret",
+            ]
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        response = self.client.post(
+            "/api/users/me/session/step-up/",
+            {},
+            format="json",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+
+        session = UserSession.objects.get(
+            user=self.user
+        )
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+    def test_step_up_rejected_when_not_required(
+        self
+    ):
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        access = response.data["access"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        response = self.client.post(
+            "/api/users/me/session/step-up/",
+            {
+                "code": "123456"
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+    
 
     def test_repeated_same_anomaly_is_audit_throttled(
         self

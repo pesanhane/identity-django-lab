@@ -9,6 +9,9 @@ from .session_management import (
     get_operating_system,
 )
 
+from django.db import transaction
+from django.utils import timezone
+
 
 @dataclass(frozen=True)
 class SessionRiskResult:
@@ -252,3 +255,77 @@ def audit_session_risk(
         status_code=200,
         result="WARNING",
     )
+
+
+@transaction.atomic
+def apply_session_risk_response(
+    *,
+    session,
+    request,
+    risk,
+):
+
+    locked_session = (
+        session.__class__.objects
+        .select_for_update()
+        .get(pk=session.pk)
+    )
+
+    # Enquanto existe um step-up pendente,
+    # não reduzir o risco persistido.
+    if (
+        locked_session.requires_step_up
+        and risk.score < locked_session.risk_score
+    ):
+        return locked_session
+
+    locked_session.risk_score = risk.score
+    locked_session.risk_level = risk.level
+
+        
+
+    update_fields = [
+        "risk_score",
+        "risk_level",
+    ]
+
+    if (
+        risk.level == "HIGH"
+        and not locked_session.requires_step_up
+    ):
+
+        locked_session.requires_step_up = True
+        locked_session.step_up_required_at = (
+            timezone.now()
+        )
+
+        update_fields.extend([
+            "requires_step_up",
+            "step_up_required_at",
+        ])
+
+        locked_session.save(
+            update_fields=update_fields
+        )
+
+        create_session_audit(
+            request=request,
+            user=locked_session.user,
+            action="SESSION_STEP_UP_REQUIRED",
+            description=(
+                "Step-up MFA required because "
+                f"session risk reached HIGH. "
+                f"score={risk.score}; "
+                f"reasons={','.join(risk.reasons)}."
+            ),
+            status_code=403,
+            result="WARNING",
+        )
+
+        return locked_session
+
+    locked_session.save(
+        update_fields=update_fields
+    )
+
+    return locked_session

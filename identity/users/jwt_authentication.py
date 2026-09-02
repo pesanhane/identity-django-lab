@@ -1,15 +1,20 @@
 from django.utils import timezone
 from datetime import timedelta
 
+from rest_framework.exceptions import (
+    AuthenticationFailed,
+    PermissionDenied,
+)
 
-from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.authentication import (
     JWTAuthentication,
 )
 
+
 from .session_risk import (
     evaluate_session_risk,
     audit_session_risk,
+    apply_session_risk_response,
 )
 
 from .models import UserSession
@@ -137,5 +142,42 @@ class SessionJWTAuthentication(
             request=request,
             risk=risk,
         )
+
+        if (
+            risk.level == "HIGH"
+            and not user.mfa_enabled
+        ):
+            raise AuthenticationFailed(
+                "High-risk session detected. "
+                "Please authenticate again."
+            )
+
+        session = apply_session_risk_response(
+            session=session,
+            request=request,
+            risk=risk,
+        )
+
+        step_up_allowed_paths = {
+            "/api/users/me/session/step-up/",
+            "/api/users/logout/",
+        }
+
+        if (
+            session.requires_step_up
+            and request.path
+            not in step_up_allowed_paths
+        ):
+
+            raise PermissionDenied(
+                {
+                    "detail": (
+                        "Additional authentication "
+                        "is required for this session."
+                    ),
+                    "code": "step_up_required",
+                    "risk_level": session.risk_level,
+                }
+            )
 
         return authentication

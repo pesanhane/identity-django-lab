@@ -371,6 +371,32 @@ class UserSession(models.Model):
         blank=True,
     )
 
+
+    requires_step_up = models.BooleanField(
+        default=False,
+    )
+
+    step_up_required_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    step_up_verified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    risk_score = models.PositiveSmallIntegerField(
+        default=0,
+    )
+
+    risk_level = models.CharField(
+        max_length=10,
+        default="NONE",
+    )
+
+        
+
     @property
     def is_revoked(self):
         return self.revoked_at is not None
@@ -380,3 +406,5 @@ class UserSession(models.Model):
             f"{self.user.username} - "
             f"{self.device_name or 'Unknown device'}"
         )
+
+        
