@@ -1,5 +1,6 @@
 from rest_framework.test import APITestCase
 
+
 from rest_framework import status
 
 
@@ -118,40 +119,47 @@ class UserSessionAuthenticationTest(APITestCase):
         )
     def test_session_stores_request_metadata(self):
 
+        user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
         response = self.client.post(
-            self.normal_login_url,
+            "/api/token/",
             {
                 "username": self.user.username,
                 "password": self.password,
             },
             format="json",
-            HTTP_USER_AGENT="Firefox Test Browser",
-            REMOTE_ADDR="192.168.1.50",
+            HTTP_USER_AGENT=user_agent,
+            REMOTE_ADDR="192.168.1.100",
         )
 
         self.assertEqual(
             response.status_code,
-            200,
-            response.data,
+            status.HTTP_200_OK,
         )
 
-        session = UserSession.objects.get(
-            user=self.user
-        )
-
-        self.assertEqual(
-            session.ip_address,
-            "192.168.1.50",
-        )
-
-        self.assertEqual(
-            session.user_agent,
-            "Firefox Test Browser",
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
         )
 
         self.assertEqual(
             session.device_name,
-            "Firefox Test Browser",
+            "Firefox 153 • Ubuntu/Linux",
+        )
+
+        self.assertEqual(
+            session.user_agent,
+            user_agent,
+        )
+
+        self.assertEqual(
+            session.ip_address,
+            "192.168.1.100",
         )
 
     def test_sessions_endpoint_requires_authentication(self):
@@ -1575,7 +1583,178 @@ class UserSessionAuthenticationTest(APITestCase):
         self.assertIsNotNone(
             session.revoked_at
         )
+    def test_login_creates_friendly_device_name(
+        self
+    ):
 
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            HTTP_USER_AGENT=(
+                "Mozilla/5.0 "
+                "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+                "Gecko/20100101 Firefox/153.0"
+            ),
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        self.assertEqual(
+            session.device_name,
+            "Firefox 153 • Ubuntu/Linux",
+        )
+
+    def test_chrome_windows_device_is_identified(
+        self
+    ):
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            HTTP_USER_AGENT=(
+                "Mozilla/5.0 "
+                "(Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0.0.0 Safari/537.36"
+            ),
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        self.assertEqual(
+            session.device_name,
+            "Chrome 140 • Windows",
+        )
+
+    def test_authenticated_request_updates_old_last_activity(
+        self
+    ):
+
+        login_response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            login_response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        access = login_response.data[
+            "access"
+        ]
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        old_activity = (
+            timezone.now()
+            - timedelta(minutes=10)
+        )
+
+        UserSession.objects.filter(
+            pk=session.pk
+        ).update(
+            last_activity=old_activity
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        session.refresh_from_db()
+
+        self.assertGreater(
+            session.last_activity,
+            old_activity,
+        )
+
+    def test_recent_last_activity_is_not_updated(
+        self
+    ):
+
+        login_response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+        )
+
+        access = login_response.data[
+            "access"
+        ]
+
+        session = (
+            UserSession.objects
+            .filter(user=self.user)
+            .latest("created_at")
+        )
+
+        original_activity = session.last_activity
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {access}"
+            )
+        )
+
+        self.client.get(
+            "/api/users/me/sessions/"
+        )
+
+        session.refresh_from_db()
+
+        self.assertEqual(
+            session.last_activity,
+            original_activity,
+        )
 class UserSessionMFAAuthenticationTest(APITestCase):
 
     def setUp(self):

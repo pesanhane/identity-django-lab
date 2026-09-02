@@ -1,4 +1,6 @@
 from django.utils import timezone
+from datetime import timedelta
+
 
 from rest_framework.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.authentication import (
@@ -11,6 +13,12 @@ from .models import UserSession
 class SessionJWTAuthentication(
     JWTAuthentication
 ):
+
+
+
+    ACTIVITY_UPDATE_INTERVAL = timedelta(
+        minutes=5
+    )
 
     def get_user(self, validated_token):
 
@@ -47,8 +55,37 @@ class SessionJWTAuthentication(
             )
 
         if session.expires_at <= timezone.now():
+
             raise AuthenticationFailed(
                 "Session has expired."
+            )
+
+        # ============================================================
+        # UPDATE LAST ACTIVITY
+        # ============================================================
+        #
+        # Não atualizamos em cada request.
+        #
+        # Apenas fazemos uma escrita quando passaram
+        # pelo menos 5 minutos desde a última atividade
+        # registada.
+        # ============================================================
+
+        now = timezone.now()
+
+        activity_threshold = (
+            now
+            - self.ACTIVITY_UPDATE_INTERVAL
+        )
+
+        if session.last_activity < activity_threshold:
+
+            UserSession.objects.filter(
+                pk=session.pk,
+                last_activity__lt=activity_threshold,
+                revoked_at__isnull=True,
+            ).update(
+                last_activity=now
             )
 
         return user

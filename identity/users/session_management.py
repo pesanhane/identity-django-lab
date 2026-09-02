@@ -1,4 +1,5 @@
 
+import re
 from datetime import datetime, timezone as dt_timezone
 
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -34,12 +35,6 @@ def get_client_ip(request):
 
 
 def get_device_name(request):
-    """
-    Identificação simples do dispositivo baseada
-    no User-Agent.
-
-    Não é usada como mecanismo de segurança.
-    """
 
     user_agent = request.META.get(
         "HTTP_USER_AGENT",
@@ -49,7 +44,17 @@ def get_device_name(request):
     if not user_agent:
         return "Unknown device"
 
-    return user_agent[:255]
+    browser = get_browser_name(
+        user_agent
+    )
+
+    operating_system = get_operating_system(
+        user_agent
+    )
+
+    return (
+        f"{browser} • {operating_system}"
+    )[:255]
 
 
 def create_user_session(
@@ -294,3 +299,174 @@ def blacklist_user_session(session):
     )
 
     return True
+
+
+def get_browser_name(user_agent):
+
+    # ============================================================
+    # MICROSOFT EDGE
+    # ============================================================
+
+    match = re.search(
+        r"Edg/([\d.]+)",
+        user_agent,
+    )
+
+    if match:
+
+        version = match.group(1).split(".")[0]
+
+        return f"Edge {version}"
+
+    # ============================================================
+    # GOOGLE CHROME
+    # ============================================================
+
+    match = re.search(
+        r"Chrome/([\d.]+)",
+        user_agent,
+    )
+
+    if match:
+
+        version = match.group(1).split(".")[0]
+
+        return f"Chrome {version}"
+
+    # ============================================================
+    # FIREFOX
+    # ============================================================
+
+    match = re.search(
+        r"Firefox/([\d.]+)",
+        user_agent,
+    )
+
+    if match:
+
+        version = match.group(1).split(".")[0]
+
+        return f"Firefox {version}"
+
+    # ============================================================
+    # SAFARI
+    # ============================================================
+
+    if (
+        "Safari/" in user_agent
+        and "Version/" in user_agent
+    ):
+
+        match = re.search(
+            r"Version/([\d.]+)",
+            user_agent,
+        )
+
+        if match:
+
+            version = (
+                match.group(1)
+                .split(".")[0]
+            )
+
+            return f"Safari {version}"
+
+        return "Safari"
+
+    return "Unknown browser"
+
+
+
+def get_operating_system(user_agent):
+
+    # ============================================================
+    # ANDROID
+    # ============================================================
+
+    if "Android" in user_agent:
+
+        match = re.search(
+            r"Android ([\d.]+)",
+            user_agent,
+        )
+
+        if match:
+
+            return (
+                f"Android "
+                f"{match.group(1)}"
+            )
+
+        return "Android"
+
+    # ============================================================
+    # IPHONE / IPAD
+    # ============================================================
+
+    if (
+        "iPhone" in user_agent
+        or "iPad" in user_agent
+    ):
+
+        match = re.search(
+            r"OS ([\d_]+)",
+            user_agent,
+        )
+
+        if match:
+
+            version = (
+                match.group(1)
+                .replace("_", ".")
+            )
+
+            return f"iOS {version}"
+
+        return "iOS"
+
+    # ============================================================
+    # WINDOWS
+    # ============================================================
+
+    if "Windows NT 10.0" in user_agent:
+        return "Windows"
+
+    if "Windows NT 6.3" in user_agent:
+        return "Windows 8.1"
+
+    if "Windows NT 6.1" in user_agent:
+        return "Windows 7"
+
+    # ============================================================
+    # MACOS
+    # ============================================================
+
+    if "Mac OS X" in user_agent:
+
+        match = re.search(
+            r"Mac OS X ([\d_]+)",
+            user_agent,
+        )
+
+        if match:
+
+            version = (
+                match.group(1)
+                .replace("_", ".")
+            )
+
+            return f"macOS {version}"
+
+        return "macOS"
+
+    # ============================================================
+    # LINUX
+    # ============================================================
+
+    if "Ubuntu" in user_agent:
+        return "Ubuntu/Linux"
+
+    if "Linux" in user_agent:
+        return "Linux"
+
+    return "Unknown OS"
