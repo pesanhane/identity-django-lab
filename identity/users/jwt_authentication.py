@@ -7,6 +7,11 @@ from rest_framework_simplejwt.authentication import (
     JWTAuthentication,
 )
 
+from .session_risk import (
+    evaluate_session_risk,
+    audit_session_risk,
+)
+
 from .models import UserSession
 
 
@@ -89,3 +94,48 @@ class SessionJWTAuthentication(
             )
 
         return user
+    def authenticate(self, request):
+
+        authentication = super().authenticate(
+            request
+        )
+
+        if authentication is None:
+            return None
+
+        user, validated_token = authentication
+
+        session_id = validated_token.get(
+            "session_id"
+        )
+
+        if not session_id:
+
+            return authentication
+
+        try:
+
+            session = UserSession.objects.get(
+                id=session_id,
+                user=user,
+            )
+
+        except (
+            UserSession.DoesNotExist,
+            ValueError,
+        ):
+
+            return authentication
+
+        risk = evaluate_session_risk(
+            session=session,
+            request=request,
+        )
+
+        audit_session_risk(
+            session=session,
+            request=request,
+            risk=risk,
+        )
+
+        return authentication

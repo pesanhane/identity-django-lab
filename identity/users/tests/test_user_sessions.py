@@ -11,7 +11,10 @@ from users.models import (
     Organization,
 )
 
+
+
 import pyotp
+from users.models import AuditLog
 
 from django.core.cache import cache
 from users.mfa import generate_secret
@@ -1938,6 +1941,291 @@ class UserSessionAuthenticationTest(APITestCase):
             session.ip_address,
             "41.77.100.30",
         )
+
+    def test_same_session_environment_does_not_create_risk_audit(
+        self
+    ):
+        
+        self.assign_risk_test_organization()
+        user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=user_agent,
+        )
+
+        access = response.data["access"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertFalse(
+            AuditLog.objects.filter(
+                user=self.user,
+                action="SESSION_RISK_DETECTED",
+            ).exists()
+        )
+
+    def test_ip_change_creates_session_risk_audit(
+        self
+    ):
+        self.assign_risk_test_organization()
+        user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=user_agent,
+        )
+
+        access = response.data["access"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="197.249.20.20",
+            HTTP_USER_AGENT=user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=self.user,
+                action="SESSION_RISK_DETECTED",
+            ).exists()
+        )
+
+    def test_device_change_creates_session_risk_audit(
+        self
+    ):
+        self.assign_risk_test_organization()
+        login_user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        suspicious_user_agent = (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=login_user_agent,
+        )
+
+        access = response.data["access"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        audit = AuditLog.objects.filter(
+            user=self.user,
+            action="SESSION_RISK_DETECTED",
+        ).latest("created_at")
+
+        self.assertIn(
+            "DEVICE_CHANGED",
+            audit.description,
+        )
+
+        self.assertIn(
+            "score=60",
+            audit.description,
+        )
+
+    def test_ip_and_device_change_generate_high_risk(
+        self
+    ):
+        self.assign_risk_test_organization()
+        login_user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        suspicious_user_agent = (
+            "Mozilla/5.0 "
+            "(Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 Safari/537.36"
+        )
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=login_user_agent,
+        )
+
+        access = response.data["access"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        response = self.client.get(
+            "/api/users/me/sessions/",
+            REMOTE_ADDR="41.77.100.100",
+            HTTP_USER_AGENT=suspicious_user_agent,
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_200_OK,
+        )
+
+        audit = AuditLog.objects.filter(
+            user=self.user,
+            action="SESSION_RISK_DETECTED",
+        ).latest("created_at")
+
+        self.assertIn(
+            "IP_CHANGED",
+            audit.description,
+        )
+
+        self.assertIn(
+            "DEVICE_CHANGED",
+            audit.description,
+        )
+
+        self.assertIn(
+            "Risk level=HIGH",
+            audit.description,
+        )
+
+        self.assertIn(
+            "score=90",
+            audit.description,
+        )
+
+    def test_repeated_same_anomaly_is_audit_throttled(
+        self
+    ):
+        self.assign_risk_test_organization()
+        login_user_agent = (
+            "Mozilla/5.0 "
+            "(X11; Ubuntu; Linux x86_64; rv:153.0) "
+            "Gecko/20100101 Firefox/153.0"
+        )
+
+        response = self.client.post(
+            "/api/token/",
+            {
+                "username": self.user.username,
+                "password": self.password,
+            },
+            format="json",
+            REMOTE_ADDR="197.249.10.10",
+            HTTP_USER_AGENT=login_user_agent,
+        )
+
+        access = response.data["access"]
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}"
+        )
+
+        for _ in range(3):
+
+            self.client.get(
+                "/api/users/me/sessions/",
+                REMOTE_ADDR="41.77.100.20",
+                HTTP_USER_AGENT=login_user_agent,
+            )
+
+        count = AuditLog.objects.filter(
+            user=self.user,
+            action="SESSION_RISK_DETECTED",
+        ).count()
+
+        self.assertEqual(
+            count,
+            1,
+        )
+
+    def assign_risk_test_organization(self):
+
+        organization = Organization.objects.create(
+            name="Risk Test Organization"
+        )
+
+        self.user.organization = organization
+
+        self.user.save(
+            update_fields=["organization"]
+        )
+
+        return organization
+
 class UserSessionMFAAuthenticationTest(APITestCase):
 
     def setUp(self):
@@ -2122,6 +2410,20 @@ class UserSessionMFAAuthenticationTest(APITestCase):
                 user=self.user
             ).exists()
         )
+
+    def assign_risk_test_organization(self):
+
+        organization = Organization.objects.create(
+            name="Risk Test Organization"
+        )
+
+        self.user.organization = organization
+
+        self.user.save(
+            update_fields=["organization"]
+        )
+
+        return organization
 
 
 class UserSessionLifecycleAuditTest(APITestCase):
