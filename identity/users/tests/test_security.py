@@ -5,6 +5,8 @@ from datetime import timedelta
 from django.test import TestCase
 from django.utils import timezone
 
+
+
 from rest_framework import status
 from rest_framework.test import APIClient, APIRequestFactory
 
@@ -19,6 +21,7 @@ from users.models import (
     Permission,
     Organization,
     AuditLog,
+    UserSession,
 )
 
 from users.utils import create_audit_log
@@ -211,6 +214,58 @@ class SecurityTestBase(TestCase):
         )
 
         return refresh
+
+
+    def authenticate_with_recent_step_up(
+        self,
+        user,
+    ):
+        user.mfa_enabled = True
+        user.save(
+            update_fields=[
+                "mfa_enabled",
+            ]
+        )
+
+        session = UserSession.objects.create(
+            user=user,
+            jti=(
+                f"security-step-up-{user.id}-"
+                f"{timezone.now().timestamp()}"
+            ),
+            device_name="Test Device",
+            user_agent="Test User Agent",
+            ip_address="127.0.0.1",
+            expires_at=(
+                timezone.now()
+                + timedelta(hours=1)
+            ),
+            step_up_verified_at=timezone.now(),
+            requires_step_up=False,
+            risk_score=0,
+            risk_level="NONE",
+        )
+
+        refresh = RefreshToken.for_user(
+            user
+        )
+
+        refresh["session_id"] = str(
+            session.id
+        )
+
+        access = refresh.access_token
+        access["session_id"] = str(
+            session.id
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {str(access)}"
+            )
+        )
+
+        return session
 
     def clear_authentication(self):
 
@@ -1788,7 +1843,7 @@ class AuditEventIntegrityTest(SecurityTestBase):
 
     def test_create_role_generates_audit_event(self):
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -1833,7 +1888,7 @@ class AuditEventIntegrityTest(SecurityTestBase):
             description="Manager role",
         )
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -1874,7 +1929,7 @@ class AuditEventIntegrityTest(SecurityTestBase):
             description="Manager role",
         )
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -1905,10 +1960,9 @@ class AuditEventIntegrityTest(SecurityTestBase):
 
     def test_create_permission_generates_audit_event(self):
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
-
         response = self.client.post(
             "/api/users/permissions/",
             {
@@ -1946,7 +2000,7 @@ class AuditEventIntegrityTest(SecurityTestBase):
             description="System test permission",
         )
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -1986,7 +2040,7 @@ class AuditEventIntegrityTest(SecurityTestBase):
             description="System test permission",
         )
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -2023,7 +2077,7 @@ class AuditEventIntegrityTest(SecurityTestBase):
             update_fields=["is_active"]
         )
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -2054,7 +2108,7 @@ class AuditEventIntegrityTest(SecurityTestBase):
 
     def test_deactivate_user_generates_audit_event(self):
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -2145,7 +2199,7 @@ class InputValidationSecurityTest(SecurityTestBase):
 
     def test_nonexistent_permission_cannot_be_updated(self):
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -2164,7 +2218,7 @@ class InputValidationSecurityTest(SecurityTestBase):
 
     def test_nonexistent_role_cannot_be_deleted(self):
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -2186,7 +2240,7 @@ class AdminAuthorizationSecurityTest(SecurityTestBase):
 
     def test_admin_can_create_role(self):
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -2209,7 +2263,7 @@ class AdminAuthorizationSecurityTest(SecurityTestBase):
 
     def test_admin_can_create_permission(self):
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 
@@ -2234,7 +2288,7 @@ class AdminAuthorizationSecurityTest(SecurityTestBase):
             description="Original",
         )
 
-        self.authenticate(
+        self.authenticate_with_recent_step_up(
             self.admin
         )
 

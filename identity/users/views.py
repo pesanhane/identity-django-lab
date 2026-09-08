@@ -6,6 +6,8 @@ from .rbac import DynamicPermission
 from rest_framework.exceptions import Throttled
 from .authentication import apply_mfa_rate_limit
 
+from .sensitive_actions import require_recent_step_up
+
 from .models import (
     User,
     AuditLog,
@@ -1150,6 +1152,11 @@ class RoleListView(APIView):
 
     def post(self, request):
 
+        require_recent_step_up(
+            request=request,
+            action="ROLE_CREATE",
+        )
+
         organization = require_organization(
             request
         )
@@ -1181,6 +1188,8 @@ class RoleListView(APIView):
             status=status.HTTP_201_CREATED
         )
 
+    
+
 
 class PermissionListView(APIView):
 
@@ -1205,6 +1214,11 @@ class PermissionListView(APIView):
 
     def post(self, request):
 
+        require_recent_step_up(
+            request=request,
+            action="PERMISSION_CREATE",
+        )
+
         serializer = PermissionSerializer(
             data=request.data
         )
@@ -1225,8 +1239,6 @@ class PermissionListView(APIView):
             PermissionSerializer(permission).data,
             status=status.HTTP_201_CREATED
         )
-
-
 
 
 class RoleDetailView(APIView):
@@ -1268,6 +1280,11 @@ class RoleDetailView(APIView):
         partial=False
     ):
 
+        require_recent_step_up(
+            request=request,
+            action="ROLE_UPDATE",
+        )
+
         organization = require_organization(request)
 
         role = get_object_or_404(
@@ -1302,6 +1319,7 @@ class RoleDetailView(APIView):
             RoleSerializer(role).data
         )
 
+
     # ==========================================================
     # PUT
     # ==========================================================
@@ -1331,6 +1349,11 @@ class RoleDetailView(APIView):
     # ==========================================================
 
     def delete(self, request, id):
+
+        require_recent_step_up(
+            request=request,
+            action="ROLE_DELETE",
+        )
 
         organization = require_organization(request)
 
@@ -1365,6 +1388,10 @@ class PermissionDetailView(APIView):
 
         return super().get_permissions()
 
+    # ==========================================================
+    # GET PERMISSION
+    # ==========================================================
+
     def get(self, request, id):
 
         permission = get_object_or_404(
@@ -1377,10 +1404,20 @@ class PermissionDetailView(APIView):
         )
 
     # ==========================================================
-    # MÉTODO PRIVADO
+    # UPDATE PERMISSION
     # ==========================================================
 
-    def update_permission(self, request, id, partial=False):
+    def update_permission(
+        self,
+        request,
+        id,
+        partial=False
+    ):
+
+        require_recent_step_up(
+            request=request,
+            action="PERMISSION_UPDATE",
+        )
 
         permission = get_object_or_404(
             Permission,
@@ -1410,6 +1447,8 @@ class PermissionDetailView(APIView):
         )
 
     # ==========================================================
+    # PUT
+    # ==========================================================
 
     def put(self, request, id):
 
@@ -1419,6 +1458,10 @@ class PermissionDetailView(APIView):
             partial=False
         )
 
+    # ==========================================================
+    # PATCH
+    # ==========================================================
+
     def patch(self, request, id):
 
         return self.update_permission(
@@ -1427,7 +1470,16 @@ class PermissionDetailView(APIView):
             partial=True
         )
 
+    # ==========================================================
+    # DELETE
+    # ==========================================================
+
     def delete(self, request, id):
+
+        require_recent_step_up(
+            request=request,
+            action="PERMISSION_DELETE",
+        )
 
         permission = get_object_or_404(
             Permission,
@@ -1447,7 +1499,6 @@ class PermissionDetailView(APIView):
         return Response(
             status=status.HTTP_204_NO_CONTENT
         )
-
 # ============================================================
 # GROUP MANAGEMENT
 # ============================================================
@@ -1489,6 +1540,11 @@ class GroupListView(APIView):
     # ==========================================================
 
     def post(self, request):
+
+        require_recent_step_up(
+            request=request,
+            action="GROUP_CREATE",
+        )
 
         organization = require_organization(request)
 
@@ -1564,6 +1620,12 @@ class GroupDetailView(APIView):
         partial=False
     ):
 
+
+        require_recent_step_up(
+            request=request,
+            action="GROUP_UPDATE",
+        )
+
         organization = require_organization(request)
 
         group = get_object_or_404(
@@ -1629,6 +1691,11 @@ class GroupDetailView(APIView):
 
     def delete(self, request, id):
 
+        require_recent_step_up(
+            request=request,
+            action="GROUP_DELETE",
+        )
+
         organization = require_organization(request)
 
         group = get_object_or_404(
@@ -1663,6 +1730,11 @@ class ActivateUserView(APIView):
         return super().get_permissions()
 
     def post(self, request, id):
+
+        require_recent_step_up(
+            request=request,
+            action="USER_ACTIVATE",
+        )
 
         organization = require_organization(request)
 
@@ -1703,6 +1775,11 @@ class DeactivateUserView(APIView):
         return super().get_permissions()
 
     def post(self, request, id):
+
+        require_recent_step_up(
+            request=request,
+            action="USER_ACTIVATE",
+        )
 
         organization = require_organization(request)
 

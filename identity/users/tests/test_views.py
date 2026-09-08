@@ -3,6 +3,10 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 from rest_framework import status
 
+from datetime import timedelta
+
+from django.utils import timezone
+
 from rest_framework_simplejwt.tokens import (
     RefreshToken,
 )
@@ -14,6 +18,7 @@ from users.models import (
     AuditLog,
     Organization,
     Group,
+    UserSession,
 )
 
 
@@ -172,7 +177,48 @@ class APITestBase(TestCase):
         )
 
         return refresh
+    def authenticate_with_recent_step_up(
+        self,
+        user,
+    ):
+        user.mfa_enabled = True
+        user.save(
+            update_fields=[
+                "mfa_enabled",
+            ]
+        )
 
+        session = UserSession.objects.create(
+            user=user,
+            jti=(
+                f"view-step-up-{user.id}-"
+                f"{timezone.now().timestamp()}"
+            ),
+            device_name="Test Device",
+            user_agent="Test User Agent",
+            ip_address="127.0.0.1",
+            expires_at=(
+                timezone.now()
+                + timedelta(hours=1)
+            ),
+            step_up_verified_at=timezone.now(),
+            requires_step_up=False,
+            risk_score=0,
+            risk_level="NONE",
+        )
+
+        refresh = RefreshToken.for_user(user)
+
+        refresh["session_id"] = str(session.id)
+
+        access = refresh.access_token
+        access["session_id"] = str(session.id)
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {str(access)}"
+        )
+
+        return session
     # =========================================================
     # LOGOUT / AUTH RESET
     # =========================================================
@@ -577,6 +623,10 @@ class UserActivationViewTest(APITestBase):
 
     def test_admin_can_activate_user(self):
 
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
         self.user.is_active = False
         self.user.save()
 
@@ -608,6 +658,10 @@ class UserActivationViewTest(APITestBase):
 
     def test_admin_can_deactivate_user(self):
 
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
         response = self.client.post(
             f"/api/users/{self.user.id}/deactivate/"
         )
@@ -635,6 +689,10 @@ class UserActivationViewTest(APITestBase):
     # =========================================================
 
     def test_admin_cannot_deactivate_own_account(self):
+
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
 
         response = self.client.post(
             f"/api/users/{self.admin.id}/deactivate/"
@@ -665,6 +723,10 @@ class UserActivationViewTest(APITestBase):
         self
     ):
 
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
         self.other_user.is_active = False
         self.other_user.save()
 
@@ -681,6 +743,79 @@ class UserActivationViewTest(APITestBase):
 
         self.assertFalse(
             self.other_user.is_active
+        )
+
+    def test_admin_cannot_activate_user_without_recent_step_up(
+        self
+    ):
+        self.admin.mfa_enabled = True
+        self.admin.save(
+            update_fields=[
+                "mfa_enabled",
+            ]
+        )
+
+        session = UserSession.objects.create(
+            user=self.admin,
+            jti="activate-without-step-up",
+            device_name="Test Device",
+            user_agent="Test User Agent",
+            ip_address="127.0.0.1",
+            expires_at=(
+                timezone.now()
+                + timedelta(hours=1)
+            ),
+        )
+
+        refresh = RefreshToken.for_user(
+            self.admin
+        )
+
+        refresh["session_id"] = str(
+            session.id
+        )
+
+        access = refresh.access_token
+        access["session_id"] = str(
+            session.id
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=(
+                f"Bearer {str(access)}"
+            )
+        )
+
+        self.user.is_active = False
+        self.user.save(
+            update_fields=[
+                "is_active",
+            ]
+        )
+
+        response = self.client.post(
+            f"/api/users/{self.user.id}/activate/"
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN
+        )
+
+        session.refresh_from_db()
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        self.assertIsNotNone(
+            session.step_up_required_at
+        )
+
+        self.user.refresh_from_db()
+
+        self.assertFalse(
+            self.user.is_active
         )
 
 
@@ -1206,6 +1341,10 @@ class RoleViewTest(APITestBase):
 
     def test_admin_can_create_role(self):
 
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
         data = {
             "name": "Manager",
             "description": "Gestor do sistema",
@@ -1278,6 +1417,10 @@ class RoleViewTest(APITestBase):
 
     def test_admin_can_update_role(self):
 
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
         data = {
             "name": "Administrator",
             "description": "Administrator atualizado",
@@ -1317,6 +1460,9 @@ class RoleViewTest(APITestBase):
 
     def test_admin_cannot_create_duplicate_role(self):
 
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
         data = {
             "name": "Admin",
             "description": "Role duplicada",
@@ -1340,6 +1486,9 @@ class RoleViewTest(APITestBase):
 
     def test_admin_can_delete_role(self):
 
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
         role = Role.objects.create(
             name="Temporary",
             description="Role temporária",
@@ -1439,6 +1588,10 @@ class PermissionViewTest(APITestBase):
 
     def test_admin_can_create_permission(self):
 
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
         data = {
             "code": "profile.update",
             "description": "Atualizar perfil"
@@ -1498,6 +1651,10 @@ class PermissionViewTest(APITestBase):
 
     def test_admin_can_update_permission(self):
 
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
         permission = self.permissions[
             "user.view"
         ]
@@ -1537,6 +1694,10 @@ class PermissionViewTest(APITestBase):
     # =========================================================
 
     def test_admin_can_delete_permission(self):
+
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
 
         permission = Permission.objects.create(
             code="temporary.permission",
@@ -1629,6 +1790,9 @@ class GroupViewTest(APITestBase):
     # =========================================================
 
     def test_admin_can_create_group(self):
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
 
         data = {
             "name": "Developers",
@@ -1699,6 +1863,9 @@ class GroupViewTest(APITestBase):
     # =========================================================
 
     def test_admin_can_update_group(self):
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
 
         group = Group.objects.create(
             name="Developers",
@@ -1742,6 +1909,9 @@ class GroupViewTest(APITestBase):
     # =========================================================
 
     def test_admin_cannot_create_duplicate_group(self):
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
 
         Group.objects.create(
             name="Developers",
@@ -1769,6 +1939,9 @@ class GroupViewTest(APITestBase):
     # =========================================================
 
     def test_admin_can_delete_group(self):
+        self.authenticate_with_recent_step_up(
+            self.admin
+        )
 
         group = Group.objects.create(
             name="Temporary",

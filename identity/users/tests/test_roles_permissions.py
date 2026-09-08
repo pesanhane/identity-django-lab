@@ -1,13 +1,19 @@
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+
+from datetime import timedelta
+
+from django.utils import timezone
+
+
 from users.models import (
     User,
     Organization,
     Role,
     Permission,
+    UserSession,
 )
-
 
 class RolePermissionManagementTest(TestCase):
 
@@ -143,6 +149,44 @@ class RolePermissionManagementTest(TestCase):
     def authenticate(self, user):
         self.client.force_authenticate(user=user)
 
+    
+    def authenticate_with_recent_step_up(
+        self,
+        user,
+    ):
+
+        user.mfa_enabled = True
+        user.save(
+            update_fields=[
+                "mfa_enabled",
+            ]
+        )
+
+        session = UserSession.objects.create(
+            user=user,
+            jti=f"test-{user.id}-{timezone.now().timestamp()}",
+            device_name="Test Device",
+            user_agent="Test User Agent",
+            ip_address="127.0.0.1",
+            expires_at=(
+                timezone.now()
+                + timedelta(hours=1)
+            ),
+            step_up_verified_at=timezone.now(),
+            requires_step_up=False,
+            risk_score=0,
+            risk_level="NONE",
+        )
+
+        self.client.force_authenticate(
+            user=user,
+            token={
+                "session_id": str(session.id),
+            },
+        )
+
+        return session
+
     # ==========================================================
     # ROLES - LIST
     # ==========================================================
@@ -184,7 +228,10 @@ class RolePermissionManagementTest(TestCase):
     # ==========================================================
 
     def test_admin_can_create_role(self):
-        self.authenticate(self.admin_user)
+    
+        self.authenticate_with_recent_step_up(
+            self.admin_user
+        )
 
         response = self.client.post(
             "/api/users/roles/",
@@ -227,6 +274,70 @@ class RolePermissionManagementTest(TestCase):
             },
         )
 
+
+    def test_admin_cannot_create_role_without_recent_step_up(
+        self
+    ):
+        self.admin_user.mfa_enabled = True
+        self.admin_user.save(
+            update_fields=[
+                "mfa_enabled",
+            ]
+        )
+
+        session = UserSession.objects.create(
+            user=self.admin_user,
+            jti="admin-no-step-up",
+            device_name="Test Device",
+            user_agent="Test User Agent",
+            ip_address="127.0.0.1",
+            expires_at=(
+                timezone.now()
+                + timedelta(hours=1)
+            ),
+        )
+
+        self.client.force_authenticate(
+            user=self.admin_user,
+            token={
+                "session_id": str(session.id),
+            },
+        )
+
+        response = self.client.post(
+            "/api/users/roles/",
+            {
+                "name": "Manager",
+                "description": "Gestor",
+                "permissions": [
+                    self.permission_user_view.id,
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            403,
+        )
+
+        session.refresh_from_db()
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        self.assertIsNotNone(
+            session.step_up_required_at
+        )
+
+        self.assertFalse(
+            Role.objects.filter(
+                name="Manager",
+                organization=self.organization,
+            ).exists()
+        )
+
     # ==========================================================
     # ROLES - GET DETAIL
     # ==========================================================
@@ -253,7 +364,11 @@ class RolePermissionManagementTest(TestCase):
     # ==========================================================
 
     def test_admin_can_update_role(self):
-        self.authenticate(self.admin_user)
+        self.authenticate_with_recent_step_up(
+            self.admin_user
+        )
+
+        
 
         response = self.client.patch(
             f"/api/users/roles/{self.admin_role.id}/",
@@ -280,8 +395,9 @@ class RolePermissionManagementTest(TestCase):
     # ==========================================================
 
     def test_admin_can_delete_role(self):
-        self.authenticate(self.admin_user)
-
+        self.authenticate_with_recent_step_up(
+            self.admin_user
+        )
         role_id = self.admin_role.id
 
         response = self.client.delete(
@@ -367,7 +483,9 @@ class RolePermissionManagementTest(TestCase):
     # ==========================================================
 
     def test_admin_can_create_permission(self):
-        self.authenticate(self.admin_user)
+        self.authenticate_with_recent_step_up(
+            self.admin_user
+        )
 
         response = self.client.post(
             "/api/users/permissions/",
@@ -415,7 +533,9 @@ class RolePermissionManagementTest(TestCase):
     # ==========================================================
 
     def test_admin_can_update_permission(self):
-        self.authenticate(self.admin_user)
+        self.authenticate_with_recent_step_up(
+            self.admin_user
+        )
 
         response = self.client.patch(
             f"/api/users/permissions/{self.permission_user_view.id}/",
@@ -442,7 +562,9 @@ class RolePermissionManagementTest(TestCase):
     # ==========================================================
 
     def test_admin_can_delete_permission(self):
-        self.authenticate(self.admin_user)
+        self.authenticate_with_recent_step_up(
+            self.admin_user
+        )
 
         permission_id = self.permission_audit.id
 
@@ -522,4 +644,63 @@ class RolePermissionManagementTest(TestCase):
         self.assertNotEqual(
             self.admin_role.organization,
             self.other_role.organization,
+        )
+
+    def test_admin_cannot_create_permission_without_recent_step_up(
+        self
+    ):
+        self.admin_user.mfa_enabled = True
+        self.admin_user.save(
+            update_fields=[
+                "mfa_enabled",
+            ]
+        )
+
+        session = UserSession.objects.create(
+            user=self.admin_user,
+            jti="admin-permission-no-step-up",
+            device_name="Test Device",
+            user_agent="Test User Agent",
+            ip_address="127.0.0.1",
+            expires_at=(
+                timezone.now()
+                + timedelta(hours=1)
+            ),
+        )
+
+        self.client.force_authenticate(
+            user=self.admin_user,
+            token={
+                "session_id": str(session.id),
+            },
+        )
+
+        response = self.client.post(
+            "/api/users/permissions/",
+            {
+                "code": "test.permission",
+                "description": "Test permission",
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            403,
+        )
+
+        session.refresh_from_db()
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        self.assertIsNotNone(
+            session.step_up_required_at
+        )
+
+        self.assertFalse(
+            Permission.objects.filter(
+                code="test.permission",
+            ).exists()
         )

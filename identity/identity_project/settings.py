@@ -18,6 +18,14 @@ TRUSTED_PROXY_IPS = [
 ]
 
 
+SESSION_STEP_UP_MAX_AGE = int(
+    os.getenv(
+        "SESSION_STEP_UP_MAX_AGE",
+        "600",
+    )
+)
+
+
 
 
 

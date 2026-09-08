@@ -1,12 +1,18 @@
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from datetime import timedelta
+
+from django.utils import timezone
+
+
 from users.models import (
     User,
     Organization,
     Group,
     Role,
     Permission,
+    UserSession,
 )
 
 
@@ -76,6 +82,46 @@ class GroupManagementTest(TestCase):
             description="Other organization group",
             organization=self.organization_b,
         )
+
+
+    def authenticate_with_recent_step_up(
+        self,
+        user,
+    ):
+        user.mfa_enabled = True
+        user.save(
+            update_fields=[
+                "mfa_enabled",
+            ]
+        )
+
+        session = UserSession.objects.create(
+            user=user,
+            jti=(
+                f"group-test-{user.id}-"
+                f"{timezone.now().timestamp()}"
+            ),
+            device_name="Test Device",
+            user_agent="Test User Agent",
+            ip_address="127.0.0.1",
+            expires_at=(
+                timezone.now()
+                + timedelta(hours=1)
+            ),
+            step_up_verified_at=timezone.now(),
+            requires_step_up=False,
+            risk_score=0,
+            risk_level="NONE",
+        )
+
+        self.client.force_authenticate(
+            user=user,
+            token={
+                "session_id": str(session.id),
+            },
+        )
+
+        return session
     # ==========================================================
     # LIST
     # ==========================================================
@@ -116,8 +162,8 @@ class GroupManagementTest(TestCase):
 
     def test_admin_can_create_group(self):
 
-        self.client.force_authenticate(
-            user=self.admin_user
+        self.authenticate_with_recent_step_up(
+            self.admin_user
         )
 
         response = self.client.post(
@@ -171,8 +217,8 @@ class GroupManagementTest(TestCase):
 
     def test_admin_can_update_group(self):
 
-        self.client.force_authenticate(
-            user=self.admin_user
+        self.authenticate_with_recent_step_up(
+            self.admin_user
         )
 
         response = self.client.patch(
@@ -207,8 +253,8 @@ class GroupManagementTest(TestCase):
 
     def test_admin_can_delete_group(self):
 
-        self.client.force_authenticate(
-            user=self.admin_user
+        self.authenticate_with_recent_step_up(
+            self.admin_user
         )
 
         group_id = self.group_a.id
@@ -253,8 +299,8 @@ class GroupManagementTest(TestCase):
 
     def test_admin_cannot_update_other_organization_group(self):
 
-        self.client.force_authenticate(
-            user=self.admin_user
+        self.authenticate_with_recent_step_up(
+            self.admin_user
         )
 
         response = self.client.patch(
@@ -283,8 +329,8 @@ class GroupManagementTest(TestCase):
 
     def test_admin_cannot_delete_other_organization_group(self):
 
-        self.client.force_authenticate(
-            user=self.admin_user
+        self.authenticate_with_recent_step_up(
+            self.admin_user
         )
 
         group_id = self.group_other_org.id
@@ -325,8 +371,8 @@ class GroupManagementTest(TestCase):
 
     def test_cannot_create_duplicate_group_in_same_organization(self):
 
-        self.client.force_authenticate(
-            user=self.admin_user
+        self.authenticate_with_recent_step_up(
+            self.admin_user
         )
 
         response = self.client.post(
@@ -416,8 +462,8 @@ class GroupManagementTest(TestCase):
 
     def test_created_group_belongs_to_authenticated_user_organization(self):
 
-        self.client.force_authenticate(
-            user=self.admin_user
+        self.authenticate_with_recent_step_up(
+            self.admin_user
         )
 
         response = self.client.post(
@@ -441,4 +487,66 @@ class GroupManagementTest(TestCase):
         self.assertEqual(
             group.organization,
             self.organization_a
+        )
+
+    def test_admin_cannot_create_group_without_recent_step_up(
+        self
+    ):
+        self.admin_user.mfa_enabled = True
+        self.admin_user.save(
+            update_fields=[
+                "mfa_enabled",
+            ]
+        )
+
+        session = UserSession.objects.create(
+            user=self.admin_user,
+            jti="admin-group-no-step-up",
+            device_name="Test Device",
+            user_agent="Test User Agent",
+            ip_address="127.0.0.1",
+            expires_at=(
+                timezone.now()
+                + timedelta(hours=1)
+            ),
+        )
+
+        self.client.force_authenticate(
+            user=self.admin_user,
+            token={
+                "session_id": str(session.id),
+            },
+        )
+
+        response = self.client.post(
+            "/api/users/groups/",
+            {
+                "name": "Sensitive Group",
+                "description": (
+                    "Should require step-up"
+                ),
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            403
+        )
+
+        session.refresh_from_db()
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        self.assertIsNotNone(
+            session.step_up_required_at
+        )
+
+        self.assertFalse(
+            Group.objects.filter(
+                organization=self.organization_a,
+                name="Sensitive Group",
+            ).exists()
         )
