@@ -1,11 +1,7 @@
 # users/tests/test_security.py
 
-from datetime import timedelta
-
 from django.test import TestCase
 from django.utils import timezone
-
-
 
 from rest_framework import status
 from rest_framework.test import APIClient, APIRequestFactory
@@ -25,7 +21,9 @@ from users.models import (
 )
 
 from users.utils import create_audit_log
+from datetime import timedelta
 
+from django.test import override_settings
 
 # =============================================================
 # BASE
@@ -2422,4 +2420,289 @@ class SecurityRegressionTest(SecurityTestBase):
         self.assertEqual(
             response.status_code,
             status.HTTP_403_FORBIDDEN,
+        )
+
+class SensitiveActionStepUpValidityTest(SecurityTestBase):
+    @override_settings(
+        SESSION_STEP_UP_MAX_AGE=600
+    )
+    def test_recent_step_up_allows_sensitive_action(self):
+
+        session = self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
+        session.step_up_verified_at = (
+            timezone.now()
+            - timedelta(seconds=300)
+        )
+
+        session.requires_step_up = False
+
+        session.save(
+            update_fields=[
+                "step_up_verified_at",
+                "requires_step_up",
+            ]
+        )
+
+        response = self.client.post(
+            "/api/users/roles/",
+            {
+                "name": "RecentStepUpRole",
+                "description": "Role created after recent step-up",
+                "permissions": [],
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_201_CREATED,
+        )
+
+        self.assertTrue(
+            Role.objects.filter(
+                name="RecentStepUpRole",
+                organization=self.organization,
+            ).exists()
+        )
+
+
+    @override_settings(
+        SESSION_STEP_UP_MAX_AGE=600
+    )
+    def test_expired_step_up_blocks_sensitive_action(self):
+
+        session = self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
+        session.step_up_verified_at = (
+            timezone.now()
+            - timedelta(seconds=601)
+        )
+
+        session.requires_step_up = False
+
+        session.step_up_required_at = None
+
+        session.save(
+            update_fields=[
+                "step_up_verified_at",
+                "requires_step_up",
+                "step_up_required_at",
+            ]
+        )
+
+        response = self.client.post(
+            "/api/users/roles/",
+            {
+                "name": "ExpiredStepUpRole",
+                "description": "Should not be created",
+                "permissions": [],
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        session.refresh_from_db()
+
+        self.assertTrue(
+            session.requires_step_up
+        )
+
+        self.assertIsNotNone(
+            session.step_up_required_at
+        )
+
+        self.assertFalse(
+            Role.objects.filter(
+                name="ExpiredStepUpRole",
+                organization=self.organization,
+            ).exists()
+        )
+
+
+    @override_settings(
+        SESSION_STEP_UP_MAX_AGE=600
+    )
+    def test_step_up_just_inside_validity_window_is_allowed(
+        self
+    ):
+
+        session = self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
+        session.step_up_verified_at = (
+            timezone.now()
+            - timedelta(seconds=599)
+        )
+
+        session.save(
+            update_fields=[
+                "step_up_verified_at",
+            ]
+        )
+
+        response = self.client.post(
+            "/api/users/roles/",
+            {
+                "name": "BoundaryValidRole",
+                "description": "Inside step-up window",
+                "permissions": [],
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_201_CREATED,
+        )
+
+    @override_settings(
+        SESSION_STEP_UP_MAX_AGE=600
+    )
+    def test_expired_step_up_generates_audit_event(self):
+
+        session = self.authenticate_with_recent_step_up(
+            self.admin
+        )
+
+        session.step_up_verified_at = (
+            timezone.now()
+            - timedelta(seconds=601)
+        )
+
+        session.requires_step_up = False
+        session.step_up_required_at = None
+
+        session.save(
+            update_fields=[
+                "step_up_verified_at",
+                "requires_step_up",
+                "step_up_required_at",
+            ]
+        )
+
+        response = self.client.post(
+            "/api/users/roles/",
+            {
+                "name": "AuditExpiredStepUpRole",
+                "description": "Must be blocked",
+                "permissions": [],
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        self.assertTrue(
+            AuditLog.objects.filter(
+                user=self.admin,
+                organization=self.organization,
+                action="SENSITIVE_ACTION_STEP_UP_REQUIRED",
+            ).exists()
+        )
+
+    def test_sensitive_action_requires_mfa(self):
+
+        session = UserSession.objects.create(
+            user=self.admin,
+            jti=f"no-mfa-{self.admin.id}-{timezone.now().timestamp()}",
+            device_name="Test Device",
+            user_agent="Test User Agent",
+            ip_address="127.0.0.1",
+            expires_at=timezone.now() + timedelta(hours=1),
+            step_up_verified_at=timezone.now(),
+            requires_step_up=False,
+            risk_score=0,
+            risk_level="NONE",
+        )
+
+        refresh = RefreshToken.for_user(self.admin)
+        refresh["session_id"] = str(session.id)
+
+        access = refresh.access_token
+        access["session_id"] = str(session.id)
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {str(access)}"
+        )
+
+        response = self.client.post(
+            "/api/users/roles/",
+            {
+                "name": "NoMFARole",
+                "description": "Must not be created",
+                "permissions": [],
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        self.assertEqual(
+            response.data["code"],
+            "mfa_required",
+        )
+
+        self.assertFalse(
+            Role.objects.filter(
+                name="NoMFARole",
+                organization=self.organization,
+            ).exists()
+        )
+
+    def test_sensitive_action_requires_session_bound_token(self):
+
+        self.admin.mfa_enabled = True
+        self.admin.save(
+            update_fields=["mfa_enabled"]
+        )
+
+        refresh = RefreshToken.for_user(
+            self.admin
+        )
+
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {str(refresh.access_token)}"
+        )
+
+        response = self.client.post(
+            "/api/users/roles/",
+            {
+                "name": "NoSessionRole",
+                "description": "Must not be created",
+                "permissions": [],
+            },
+            format="json",
+        )
+
+        self.assertEqual(
+            response.status_code,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+        self.assertEqual(
+            response.data["code"],
+            "session_required",
+        )
+
+        self.assertFalse(
+            Role.objects.filter(
+                name="NoSessionRole",
+                organization=self.organization,
+            ).exists()
         )
